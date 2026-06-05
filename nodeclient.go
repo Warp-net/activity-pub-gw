@@ -25,7 +25,7 @@ resulting from the use or misuse of this software.
 // Copyright 2025 Vadim Filin
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-package node
+package main
 
 import (
 	"context"
@@ -37,6 +37,7 @@ import (
 	"time"
 
 	camouflage "github.com/Warp-net/libp2p-camouflage-transport"
+	"github.com/libp2p/go-libp2p"
 	p2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -66,7 +67,7 @@ type nodeClient struct {
 // privileged — any one is just an entry point.
 func networkEntries(network string) ([]peer.AddrInfo, error) {
 	var entries []peer.AddrInfo
-	for _, s := range main.bootstrapByNetwork[network] {
+	for _, s := range bootstrapByNetwork[network] {
 		ai, err := peer.AddrInfoFromString(s)
 		if err != nil {
 			log.Warnf("nodeclient: bad bootstrap %q: %v", s, err)
@@ -74,7 +75,7 @@ func networkEntries(network string) ([]peer.AddrInfo, error) {
 		}
 		entries = append(entries, *ai)
 	}
-	if extra := main.envOr("GATEWAY_NODE_ADDR", ""); extra != "" {
+	if extra := envOr("GATEWAY_NODE_ADDR", ""); extra != "" {
 		ai, err := peer.AddrInfoFromString(extra)
 		if err != nil {
 			return nil, fmt.Errorf("bad GATEWAY_NODE_ADDR: %w", err)
@@ -90,7 +91,7 @@ func networkEntries(network string) ([]peer.AddrInfo, error) {
 // connectNetwork builds a libp2p host wired for Warpnet and joins through the
 // configured network's entry peers.
 func connectNetwork(ctx context.Context) (*nodeClient, error) {
-	network := main.envOr("NODE_NETWORK", main.defaultWarpnetNetwork)
+	network := envOr("NODE_NETWORK", defaultWarpnetNetwork)
 	entries, err := networkEntries(network)
 	if err != nil {
 		return nil, err
@@ -107,7 +108,7 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 
 	h, err := libp2p.New(
 		libp2p.Identity(p2pPriv),
-		libp2p.PrivateNetwork(pnet.PSK(main.generatePSK(network))),
+		libp2p.PrivateNetwork(pnet.PSK(generatePSK(network))),
 		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
 		libp2p.WithDialTimeout(60*time.Second),
 		libp2p.Transport(camouflage.NewCamouflageTransport),
@@ -147,7 +148,7 @@ func (c *nodeClient) request(route string, payload any) ([]byte, error) {
 	defer cancel()
 	var lastErr error
 	for _, p := range c.peers {
-		bt, err := main.streamSend(ctx, c.h, p, c.priv, route, payload)
+		bt, err := streamSend(ctx, c.h, p, c.priv, route, payload)
 		if err == nil {
 			return bt, nil
 		}
@@ -169,17 +170,17 @@ type nodeSource struct {
 	client *nodeClient
 }
 
-func (s nodeSource) GetUser(preferredUsername string) (main.warpnetUser, bool) {
-	bt, err := s.client.request(main.routeGetUser, main.getUserEvent{UserId: preferredUsername})
+func (s nodeSource) GetUser(preferredUsername string) (warpnetUser, bool) {
+	bt, err := s.client.request(routeGetUser, getUserEvent{UserId: preferredUsername})
 	if err != nil {
 		log.Errorf("nodesource: get user %s: %v", preferredUsername, err)
-		return main.warpnetUser{}, false
+		return warpnetUser{}, false
 	}
-	var u main.user
+	var u user
 	if uerr := json.Unmarshal(bt, &u); uerr != nil || u.Id == "" {
-		return main.warpnetUser{}, false
+		return warpnetUser{}, false
 	}
-	return main.warpnetUser{
+	return warpnetUser{
 		ID:                u.Id,
 		PreferredUsername: u.Id,
 		DisplayName:       u.Username,
@@ -190,7 +191,7 @@ func (s nodeSource) GetUser(preferredUsername string) (main.warpnetUser, bool) {
 // runProbe joins Warpnet and fetches the GATEWAY_USER profile — a smoke test of
 // the connector path.
 func runProbe() {
-	u := main.envOr("GATEWAY_USER", "")
+	u := envOr("GATEWAY_USER", "")
 	if u == "" {
 		log.Errorln("probe: set GATEWAY_USER (and optionally GATEWAY_NODE_ADDR)")
 		return

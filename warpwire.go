@@ -25,7 +25,7 @@ resulting from the use or misuse of this software.
 // Copyright 2025 Vadim Filin
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-package node
+package main
 
 // The Warpnet wire essentials — PSK derivation, message signing, bootstrap
 // peers, and the stream request/response framing — reimplemented here (copied
@@ -123,7 +123,7 @@ func streamSend(ctx context.Context, h host.Host, p peer.ID, priv ed25519.Privat
 	}
 	defer func() { _ = s.Close() }()
 
-	data, err := json.Marshal(main.message{
+	data, err := json.Marshal(message{
 		Body:        json.RawMessage(body),
 		MessageId:   uuid.New().String(),
 		NodeId:      h.ID().String(),

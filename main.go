@@ -52,7 +52,6 @@ package main
 import (
 	"context"
 	"errors"
-	"github.com/Warp-net/activity-pub-gw/node"
 	"net/http"
 	"os"
 	"os/signal"
@@ -64,7 +63,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.0"
+const gatewayVersion = "0.1.1"
 
 const fatalFmt = "gateway: %v"
 
@@ -75,7 +74,7 @@ func main() {
 
 	// Smoke-test the libp2p connector against the configured Warpnet node.
 	if envOr("GATEWAY_PROBE", "") != "" {
-		node.runProbe()
+		runProbe()
 		return
 	}
 
@@ -128,12 +127,12 @@ func main() {
 	appCtx, appCancel := context.WithCancel(context.Background())
 
 	var src warpnetSource = staticSource{} // empty fallback when the network is unreachable
-	var nodeCli *node.nodeClient
-	if cli, cerr := node.connectNetwork(appCtx); cerr != nil {
+	var nodeCli *nodeClient
+	if cli, cerr := connectNetwork(appCtx); cerr != nil {
 		log.Warnf("gateway: %v; serving the static profile only", cerr)
 	} else {
 		nodeCli = cli
-		src = node.nodeSource{client: nodeCli}
+		src = nodeSource{client: nodeCli}
 		log.Infoln("gateway: joined Warpnet; any user is resolvable via the network")
 	}
 
