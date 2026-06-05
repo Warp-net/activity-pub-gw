@@ -1,0 +1,223 @@
+/*
+
+ Warpnet - Decentralized Social Network
+ Copyright (C) 2025 Vadim Filin, https://github.com/Warp-net,
+ <github.com.mecdy@passmail.net>
+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
+
+ You should have received a copy of the GNU Affero General Public License
+ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+WarpNet is provided “as is” without warranty of any kind, either expressed or implied.
+Use at your own risk. The maintainers shall not be liable for any damages or data loss
+resulting from the use or misuse of this software.
+*/
+
+// Copyright 2025 Vadim Filin
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// Command fediverse-gateway is a thin ActivityPub gateway that lets Warpnet
+// users be discovered and followed from Mastodon / the Fediverse. It is agnostic
+// to node, user, and network: it joins Warpnet through the network's bootstrap
+// nodes and resolves any requested user via the public routes. Outbound
+// post/follow federation follows the graph — it starts for a user once they
+// gain a Fediverse follower, and is never pinned to a configured user.
+//
+// Implemented: WebFinger, an actor document with an RSA public key, an inbox
+// that verifies HTTP signatures and answers Follow with a signed Accept
+// (persisting the follower), outbound Create(Note) fan-out, and a libp2p
+// connector to the Warpnet network (GATEWAY_PROBE smoke-tests it against
+// GATEWAY_NODE_ADDR).
+//
+// Configuration is environment-only (GATEWAY_* below, plus the standard
+// NODE_NETWORK for the libp2p side). It does NOT use CLI flags: importing the
+// libp2p stack pulls in config.init's pflag.Parse, which would clash with a
+// second flag set, and every other Warpnet node is env-configured too.
+//
+// The gateway keeps only keys on disk (RSA signing key); profile/followers
+// live in Warpnet. It is meant to run behind a tunnel that terminates TLS
+// (Tailscale Funnel, Cloudflare Tunnel, …); GATEWAY_HOST is the public
+// hostname that tunnel exposes.
+package main
+
+import (
+	"context"
+	"errors"
+	"github.com/Warp-net/activity-pub-gw/node"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+	"tailscale.com/tsnet"
+)
+
+const gatewayVersion = "0.1.0"
+
+const fatalFmt = "gateway: %v"
+
+func main() {
+	log.SetFormatter(&log.TextFormatter{FullTimestamp: true, TimestampFormat: time.DateTime})
+	log.SetOutput(os.Stdout)
+	log.SetLevel(log.InfoLevel)
+
+	// Smoke-test the libp2p connector against the configured Warpnet node.
+	if envOr("GATEWAY_PROBE", "") != "" {
+		node.runProbe()
+		return
+	}
+
+	var (
+		host          = envOr("GATEWAY_HOST", "")
+		addr          = envOr("GATEWAY_ADDR", "127.0.0.1:8080")
+		keyPath       = envOr("GATEWAY_KEY", "fediverse-gateway-key.pem")
+		followersPath = envOr("GATEWAY_FOLLOWERS", "fediverse-gateway-followers.json")
+	)
+
+	// Self-host the public endpoint via embedded Tailscale Funnel by default: the
+	// gateway becomes its own tailnet node and ListenFunnel (below) serves public
+	// HTTPS with an auto-provisioned *.ts.net cert, deriving host from the node.
+	// The persisted Dir keeps the hostname stable across restarts (a rotating
+	// name orphans existing followers). Setting GATEWAY_HOST opts out — it means
+	// you front the gateway yourself (external tunnel / reverse proxy), so it
+	// serves plain HTTP on GATEWAY_ADDR instead.
+	var ts *tsnet.Server
+	if host == "" {
+		ts = &tsnet.Server{
+			Hostname: envOr("GATEWAY_FUNNEL_HOSTNAME", "warpnet-gw"),
+			Dir:      envOr("GATEWAY_FUNNEL_DIR", "fediverse-gateway-tsnet"),
+			AuthKey:  os.Getenv("TS_AUTHKEY"),
+			UserLogf: log.Infof,
+			Logf:     log.Debugf,
+		}
+		st, uerr := ts.Up(context.Background())
+		if uerr != nil {
+			log.Fatalf("gateway: tailscale funnel: %v", uerr)
+		}
+		if st.Self == nil || st.Self.DNSName == "" {
+			log.Fatalln("gateway: tailscale funnel: node has no DNS name (enable MagicDNS + HTTPS for the tailnet)")
+		}
+		host = strings.TrimSuffix(st.Self.DNSName, ".")
+		log.Infof("gateway: tailscale funnel node up as %s", host)
+	}
+
+	key, err := loadOrCreateKey(keyPath)
+	if err != nil {
+		log.Fatalf(fatalFmt, err)
+	}
+	pubPEM, err := publicKeyPEM(key)
+	if err != nil {
+		log.Fatalf(fatalFmt, err)
+	}
+
+	// Join Warpnet through the network's bootstrap nodes (agnostic to any
+	// specific node) and serve any user via the network. Outbound federation is
+	// driven by the follower graph (onFollowed), never pinned to a user.
+	appCtx, appCancel := context.WithCancel(context.Background())
+
+	var src warpnetSource = staticSource{} // empty fallback when the network is unreachable
+	var nodeCli *node.nodeClient
+	if cli, cerr := node.connectNetwork(appCtx); cerr != nil {
+		log.Warnf("gateway: %v; serving the static profile only", cerr)
+	} else {
+		nodeCli = cli
+		src = node.nodeSource{client: nodeCli}
+		log.Infoln("gateway: joined Warpnet; any user is resolvable via the network")
+	}
+
+	// Follower graph lives in Warpnet (via the node connector); only when no
+	// node is configured does the gateway fall back to a local dev store.
+	var followers followerStore
+	var req nodeRequester
+	if nodeCli != nil {
+		followers = nodeFollowerStore{req: nodeCli}
+		req = nodeCli
+	} else {
+		ff, ferr := newFileFollowerStore(followersPath)
+		if ferr != nil {
+			appCancel()
+			log.Fatalf(fatalFmt, ferr)
+		}
+		followers = ff
+	}
+
+	g := &gateway{
+		host:      host,
+		key:       key,
+		keyPubPEM: pubPEM,
+		source:    src,
+		client:    newSafeClient(15 * time.Second),
+		sem:       make(chan struct{}, maxInflightDeliveries),
+		followers: followers,
+		req:       req,
+	}
+
+	// Outbound federation follows the graph: when a Warpnet user gains a
+	// Fediverse follower (an accepted inbound Follow), start federating that
+	// user's new posts and follows. It is never pinned to a specific user.
+	if nodeCli != nil {
+		g.onFollowed = newOutboundFederation(appCtx, nodeCli, g).start
+	}
+
+	srv := &http.Server{
+		Handler:           g.routes(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if ts == nil {
+		srv.Addr = addr
+	}
+
+	go func() {
+		log.Infof("gateway: serving Warpnet users at https://%s/users/{id}", host)
+		if ts != nil {
+			ln, lerr := ts.ListenFunnel("tcp", ":443")
+			if lerr != nil {
+				log.Fatalf("gateway: tailscale funnel: %v", lerr)
+			}
+			log.Infof("gateway: serving public https://%s via Tailscale Funnel", host)
+			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("gateway: serve: %v", err)
+			}
+			return
+		}
+		log.Infof("gateway: listening on %s, public https://%s", addr, host)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("gateway: serve: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Infoln("gateway: shutting down...")
+	appCancel()
+	if nodeCli != nil {
+		nodeCli.close()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+	if ts != nil {
+		_ = ts.Close()
+	}
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}

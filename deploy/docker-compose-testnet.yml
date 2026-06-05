@@ -1,0 +1,79 @@
+services:
+  warpnet11:
+    container_name: warpnet-testnet-1
+    image: ghcr.io/warp-net/warpnet-relay:latest
+    network_mode: host
+    restart: always
+    environment:
+      - NODE_PORT=4011
+      - NODE_HOST_V4=207.154.221.44
+      - NODE_NETWORK=testnet
+      - LOGGING_LEVEL=info
+      - LOGGING_FORMAT=json
+      - NODE_SEED=warpnet1
+      - NODE_METRICS_GATEWAY=130.94.88.38:4091
+
+  warpnet22:
+    container_name: warpnet-testnet-2
+    image: ghcr.io/warp-net/warpnet-relay:latest
+    network_mode: host
+    restart: always
+    environment:
+      - NODE_PORT=4022
+      - NODE_HOST_V4=207.154.221.44
+      - NODE_NETWORK=testnet
+      - LOGGING_LEVEL=info
+      - LOGGING_FORMAT=json
+      - NODE_SEED=warpnet2
+      - NODE_METRICS_GATEWAY=130.94.88.38:4091
+
+  warpnet33:
+    container_name: warpnet-testnet-3
+    image: ghcr.io/warp-net/warpnet-relay:latest
+    network_mode: host
+    restart: always
+    environment:
+      - NODE_PORT=4033
+      - NODE_HOST_V4=207.154.221.44
+      - NODE_NETWORK=testnet
+      - LOGGING_LEVEL=info
+      - LOGGING_FORMAT=json
+      - NODE_SEED=warpnet3
+      - NODE_METRICS_GATEWAY=130.94.88.38:4091
+
+  warpnet-moderator-testnet:
+    container_name: moderator-testnet
+    image: ghcr.io/warp-net/warpnet-moderator:latest
+    network_mode: host
+    restart: always
+    environment:
+      - NODE_PORT=4044
+      - NODE_HOST_V4=207.154.221.44
+      - NODE_NETWORK=testnet
+      - LOGGING_LEVEL=info
+      - LOGGING_FORMAT=json
+      - NODE_SEED=warpnet-moderator-testnet
+      - CGO_CPPFLAGS="-DLLAMA_DISABLE_LOGS=1"
+      - CGO_CXXFLAGS="-w -Wno-format -Wno-delete-incomplete"
+      - NODE_METRICS_GATEWAY=130.94.88.38:4091
+    volumes:
+      - /root/.warpdata:/root/.warpdata:rw
+
+  vadim-testnet:
+    container_name: vadim-testnet
+    image: ghcr.io/warp-net/warpnet-vadim:latest
+    network_mode: host
+    restart: always
+    environment:
+      - NODE_PORT=4055
+      - NODE_HOST_V4=207.154.221.44
+      - NODE_NETWORK=testnet
+      - LOGGING_LEVEL=info
+      - LOGGING_FORMAT=json
+      - NODE_SERVER_PORT=4999
+      - NODE_SERVER_PASSWORD=${NODE_SERVER_PASSWORD}
+      - NODE_METRICS_GATEWAY=130.94.88.38:4091
+    volumes:
+      - /root/.warpdata-vadim:/root/.warpdata:rw
+
+
