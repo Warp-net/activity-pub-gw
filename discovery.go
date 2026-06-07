@@ -27,74 +27,18 @@ resulting from the use or misuse of this software.
 
 package main
 
-// DHT-based discovery of Warpnet member/moderator nodes. The gateway joins the
-// network's Kademlia DHT through the relays (nodeclient.go) but the relays only
-// answer discovery — the /public/... data routes live on member/moderator
-// nodes. This finds those nodes (via the DHT routing table and the same
-// rendezvous namespace Warpnet nodes use) so request() can stream to them.
-
 import (
 	"context"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/discovery"
 	"github.com/libp2p/go-libp2p/core/peer"
-	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
-	log "github.com/sirupsen/logrus"
 )
 
 const maxMemberCandidates = 64
 
-// rendezvousNamespace mirrors Warpnet's DHT rendezvous namespace (core/dht).
-func rendezvousNamespace(network string) string {
-	return "warpnet/rendezvous/" + network
-}
-
-// runDiscovery keeps pulling member nodes out of the DHT in the background
-// (mirrors the node's rendezvous loop), so request() usually has candidates
-// ready without an on-demand lookup.
-func (c *nodeClient) runDiscovery(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	c.discoverMembers(ctx)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			c.discoverMembers(ctx)
-		}
-	}
-}
-
-// discoverMembers asks the DHT for providers of the Warpnet rendezvous
-// namespace and caches their addresses. It is best-effort: request() also falls
-// back to the DHT routing-table peers, so this is harmless when the namespace
-// has no providers.
-func (c *nodeClient) discoverMembers(ctx context.Context) {
-	if c.dht == nil {
-		return
-	}
-	rd := drouting.NewRoutingDiscovery(c.dht)
-	fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	ch, err := rd.FindPeers(fctx, rendezvousNamespace(c.network), discovery.Limit(50))
-	if err != nil {
-		log.Debugf("nodeclient: discover: %v", err)
-		return
-	}
-	for pi := range ch {
-		if pi.ID == c.h.ID() || len(pi.Addrs) == 0 {
-			continue
-		}
-		c.h.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
-	}
-}
-
-// memberCandidates lists peers that may serve the public data routes: members
+// memberCandidates lists peers that may serve the /public/... routes: members
 // known to have answered before (first), then the DHT routing-table peers
-// (Warpnet member/moderator nodes are DHT servers). The relay entry peers are
-// excluded — they only handle discovery.
+// (Warpnet member/moderator nodes are DHT servers). The relays are excluded.
 func (c *nodeClient) memberCandidates() []peer.ID {
 	seen := make(map[peer.ID]struct{})
 	out := make([]peer.ID, 0, maxMemberCandidates)
@@ -129,8 +73,8 @@ func (c *nodeClient) memberCandidates() []peer.ID {
 	return out
 }
 
-// streamToMember makes sure the peer's addresses are known (resolving them via
-// the DHT if needed) and then sends the signed request.
+// streamToMember resolves the peer's addresses via the DHT if needed, then sends
+// the signed request.
 func (c *nodeClient) streamToMember(ctx context.Context, p peer.ID, route string, payload any) ([]byte, error) {
 	if len(c.h.Peerstore().Addrs(p)) == 0 && c.dht != nil {
 		fctx, cancel := context.WithTimeout(ctx, 15*time.Second)

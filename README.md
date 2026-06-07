@@ -33,10 +33,10 @@ store is used only as a dev fallback when no node is configured).
 - **libp2p connector** (`nodeclient.go`, `warpwire.go`, `warpdto.go`,
   `discovery.go`) — a `libp2p` host built directly with `libp2p.New` (warpnet's
   PSK + camouflage transport + noise) that joins the network's Kademlia **DHT**
-  through the bootstrap relays. The relays only answer discovery, so the gateway
-  uses the DHT (same `/<network>` prefix and `warpnet/rendezvous/<network>`
-  namespace as Warpnet nodes) to find the **member/moderator** nodes that serve
-  the `/public/...` data routes, and streams requests to them. The wire DTOs,
+  (same `/<network>` prefix as Warpnet nodes) through the bootstrap relays. The
+  relays only answer discovery, so the gateway uses the DHT routing table to find
+  the **member/moderator** nodes that serve the `/public/...` data routes, and
+  streams requests to them. The wire DTOs,
   PSK/signing, route protocol IDs and bootstrap peers are copied locally, so the
   gateway imports **no warpnet Go packages** — only native libp2p (incl.
   `go-libp2p-kad-dht`). `nodeSource` resolves *any* requested user's profile;

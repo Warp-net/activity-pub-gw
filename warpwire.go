@@ -46,6 +46,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 )
@@ -117,6 +118,9 @@ func streamSend(ctx context.Context, h host.Host, p peer.ID, priv ed25519.Privat
 		}
 	}
 
+	// Allow the stream over a limited (circuit-relay) connection — member nodes
+	// behind NAT are reachable only via a relay, which NewStream otherwise rejects.
+	ctx = network.WithAllowLimitedConn(ctx, route)
 	s, err := h.NewStream(ctx, p, protocol.ID(route))
 	if err != nil {
 		return nil, fmt.Errorf("stream: new: %w", err)

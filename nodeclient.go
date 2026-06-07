@@ -54,33 +54,22 @@ var (
 	errNoEntryReachable = errors.New("nodeclient: no Warpnet entry peer reachable")
 )
 
-// nodeClient is the gateway's libp2p connection into the Warpnet network. It
-// joins the same Kademlia DHT as Warpnet nodes (warpnet's PSK / camouflage
-// transport / noise), bootstrapping through the network's relays. The relays
-// only answer discovery (PUBLIC_GET_INFO), so the gateway resolves the
-// member/moderator nodes that serve the /public/... data routes via the DHT and
-// streams requests to them. It is agnostic to any specific node and stores no
-// node/profile state.
+// nodeClient joins the Warpnet DHT through the network's relays and streams the
+// /public/... routes to the member nodes it discovers via the DHT.
 type nodeClient struct {
-	h       host.Host
-	priv    ed25519.PrivateKey
-	dht     *dht.IpfsDHT
-	network string
-	relays  map[peer.ID]struct{} // entry peers (relays): discovery/connectivity only, not data routes
+	h      host.Host
+	priv   ed25519.PrivateKey
+	dht    *dht.IpfsDHT
+	relays map[peer.ID]struct{} // entry peers (relays): discovery/connectivity only, not data routes
 
 	mu   sync.Mutex
 	good []peer.ID // member nodes known to answer data routes; tried first
 }
 
-// networkEntries are the peers the gateway uses to enter Warpnet: the network's
-// bootstrap relays (for DHT bootstrap + connectivity) plus an optional explicit
-// GATEWAY_NODE_ADDR. It also returns the set of relay IDs: relays only answer
-// discovery, so they are excluded as data-route targets — member nodes are
-// found via the DHT, and GATEWAY_NODE_ADDR (not a relay) is treated as a known
-// member hint.
-func networkEntries(network string) ([]peer.AddrInfo, map[peer.ID]struct{}, error) {
+// networkEntries are the network's bootstrap relays (the DHT entry points) plus
+// an optional explicit GATEWAY_NODE_ADDR.
+func networkEntries(network string) ([]peer.AddrInfo, error) {
 	var entries []peer.AddrInfo
-	relays := make(map[peer.ID]struct{})
 	for _, s := range bootstrapByNetwork[network] {
 		ai, err := peer.AddrInfoFromString(s)
 		if err != nil {
@@ -88,26 +77,25 @@ func networkEntries(network string) ([]peer.AddrInfo, map[peer.ID]struct{}, erro
 			continue
 		}
 		entries = append(entries, *ai)
-		relays[ai.ID] = struct{}{}
 	}
 	if extra := envOr("GATEWAY_NODE_ADDR", ""); extra != "" {
 		ai, err := peer.AddrInfoFromString(extra)
 		if err != nil {
-			return nil, nil, fmt.Errorf("bad GATEWAY_NODE_ADDR: %w", err)
+			return nil, fmt.Errorf("bad GATEWAY_NODE_ADDR: %w", err)
 		}
-		entries = append(entries, *ai) // a member hint, not a relay
+		entries = append(entries, *ai)
 	}
 	if len(entries) == 0 {
-		return nil, nil, errNoEntryPeers
+		return nil, errNoEntryPeers
 	}
-	return entries, relays, nil
+	return entries, nil
 }
 
 // connectNetwork builds a libp2p host wired for Warpnet and joins through the
 // configured network's entry peers.
 func connectNetwork(ctx context.Context) (*nodeClient, error) {
 	network := envOr("NODE_NETWORK", defaultWarpnetNetwork)
-	entries, relays, err := networkEntries(network)
+	entries, err := networkEntries(network)
 	if err != nil {
 		return nil, err
 	}
@@ -139,10 +127,7 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 		return nil, fmt.Errorf("nodeclient: new host: %w", err)
 	}
 
-	// Join the same Kademlia DHT as Warpnet nodes: protocol prefix "/<network>"
-	// and bootstrapped via the entry peers (relays). This is what lets the
-	// gateway discover the member/moderator nodes that serve /public/... — the
-	// relays themselves only handle discovery.
+	// Join Warpnet's Kademlia DHT (prefix "/<network>", bootstrapped via the relays).
 	kdht, err := dht.New(ctx, h,
 		dht.Mode(dht.ModeClient),
 		dht.ProtocolPrefix(protocol.ID("/"+network)),
@@ -153,8 +138,10 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 		return nil, fmt.Errorf("nodeclient: dht: %w", err)
 	}
 
+	relays := make(map[peer.ID]struct{}, len(entries))
 	var connected int
 	for _, e := range entries {
+		relays[e.ID] = struct{}{}
 		if cerr := h.Connect(ctx, e); cerr != nil {
 			log.Warnf("nodeclient: connect %s: %v", e.ID, cerr)
 			continue
@@ -170,35 +157,29 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 	if berr := kdht.Bootstrap(ctx); berr != nil {
 		log.Warnf("nodeclient: dht bootstrap: %v", berr)
 	}
-	// Let the routing table fill with member/moderator nodes before serving.
 	select {
 	case <-kdht.RefreshRoutingTable():
 	case <-time.After(20 * time.Second):
 	case <-ctx.Done():
 	}
-	log.Infof("nodeclient: joined Warpnet (%s) via %d relay(s); discovering member nodes via DHT", network, connected)
+	log.Infof("nodeclient: joined Warpnet (%s) via %d relay(s); discovering members via DHT", network, connected)
 
-	c := &nodeClient{h: h, priv: priv, dht: kdht, network: network, relays: relays}
-	// Seed any explicit GATEWAY_NODE_ADDR (a non-relay entry) as a known member.
-	for _, e := range entries {
-		if _, isRelay := relays[e.ID]; !isRelay {
-			c.good = append(c.good, e.ID)
-		}
-	}
-	go c.runDiscovery(ctx)
-	return c, nil
+	return &nodeClient{h: h, priv: priv, dht: kdht, relays: relays}, nil
 }
 
-// request streams the route to discovered Warpnet member/moderator nodes (the
-// peers that serve /public/...), trying each until one answers. Relays are
-// excluded — they only handle discovery. Members are found via the DHT.
+// request streams the route to the member nodes discovered via the DHT, trying
+// each until one answers (relays serve only discovery, so they are excluded).
 func (c *nodeClient) request(route string, payload any) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
 	peers := c.memberCandidates()
-	if len(peers) == 0 {
-		c.discoverMembers(ctx) // on-demand: routing table not populated yet
+	if len(peers) == 0 && c.dht != nil {
+		select { // routing table not populated yet — refresh and retry
+		case <-c.dht.RefreshRoutingTable():
+		case <-time.After(15 * time.Second):
+		case <-ctx.Done():
+		}
 		peers = c.memberCandidates()
 	}
 	if len(peers) == 0 {
