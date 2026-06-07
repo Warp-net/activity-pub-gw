@@ -130,11 +130,12 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 		libp2p.Transport(camouflage.NewCamouflageTransport),
 		libp2p.Ping(true),
 		libp2p.Security(noise.ID, noise.New),
-		libp2p.EnableAutoNATv2(),
+		// Outbound-only client (inbound is via Tailscale Funnel): advertise NO
+		// AutoNAT/NAT services. EnableNATService made this NAT'd peer answer other
+		// nodes' reachability probes with wrong verdicts, flipping public member
+		// nodes to "private" (crashing business nodes). Only the relay transport
+		// is needed — to dial member nodes that are reachable via a relay.
 		libp2p.EnableRelay(),
-		libp2p.EnableHolePunching(),
-		libp2p.EnableNATService(),
-		libp2p.NATPortMap(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("nodeclient: new host: %w", err)
