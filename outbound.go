@@ -30,6 +30,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"sync"
 	"time"
 
@@ -193,4 +194,54 @@ func (g *gateway) deliverFollow(localUser, remoteActorURL string, undo bool) {
 		return
 	}
 	log.Infof("follow: delivered to %s (undo=%v)", remoteActorURL, undo)
+}
+
+// federatedStore persists the set of local users the gateway federates outbound
+// (those that gained a Fediverse follower) so federation resumes after a
+// restart — the in-memory started map alone forgets them and stops polling.
+type federatedStore struct {
+	path string
+	mu   sync.Mutex
+	set  map[string]struct{}
+}
+
+func newFederatedStore(path string) *federatedStore {
+	s := &federatedStore{path: path, set: map[string]struct{}{}}
+	if bt, err := os.ReadFile(path); err == nil {
+		var ids []string
+		if json.Unmarshal(bt, &ids) == nil {
+			for _, id := range ids {
+				s.set[id] = struct{}{}
+			}
+		}
+	}
+	return s
+}
+
+func (s *federatedStore) list() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.set))
+	for id := range s.set {
+		out = append(out, id)
+	}
+	return out
+}
+
+func (s *federatedStore) add(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.set[id]; ok {
+		return
+	}
+	s.set[id] = struct{}{}
+	ids := make([]string, 0, len(s.set))
+	for x := range s.set {
+		ids = append(ids, x)
+	}
+	if bt, err := json.Marshal(ids); err == nil {
+		if werr := os.WriteFile(s.path, bt, 0o600); werr != nil {
+			log.Warnf("federated: persist %s: %v", s.path, werr)
+		}
+	}
 }

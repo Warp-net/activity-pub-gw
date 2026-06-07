@@ -17,6 +17,7 @@ FROM gcr.io/distroless/static-debian12
 # identity (keeps the *.ts.net hostname stable across restarts) — lives in /data.
 ENV GATEWAY_KEY=/data/key.pem \
     GATEWAY_FOLLOWERS=/data/followers.json \
+    GATEWAY_FEDERATED=/data/federated.json \
     GATEWAY_FUNNEL_DIR=/data/tsnet
 VOLUME ["/data"]
 

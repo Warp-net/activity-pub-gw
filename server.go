@@ -105,7 +105,7 @@ func (g *gateway) baseURL() string            { return "https://" + g.host }
 func (g *gateway) actorID(user string) string { return g.baseURL() + pathUsers + user }
 func (g *gateway) keyID(user string) string   { return g.actorID(user) + "#main-key" }
 
-func (g *gateway) routes() *http.ServeMux {
+func (g *gateway) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/webfinger", g.handleWebFinger)
 	mux.HandleFunc("/.well-known/nodeinfo", g.handleNodeInfoLinks)
@@ -113,7 +113,27 @@ func (g *gateway) routes() *http.ServeMux {
 	mux.HandleFunc(pathUsers, g.handleUsers)
 	mux.HandleFunc(pathInbox, g.handleSharedInbox)
 	mux.HandleFunc(pathMedia, g.handleMedia)
-	return mux
+	return logRequests(mux)
+}
+
+// logRequests logs every inbound request (method, path, status, user-agent) so
+// it's visible what Mastodon actually fetches — the actor, /media, the outbox, etc.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(sw, r)
+		log.Infof("http: %s %s -> %d (ua=%q)", r.Method, r.URL.RequestURI(), sw.status, r.UserAgent())
+	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }
 
 func (g *gateway) handleWebFinger(w http.ResponseWriter, r *http.Request) {

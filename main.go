@@ -63,7 +63,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.7"
+const gatewayVersion = "0.1.8"
 
 const fatalFmt = "gateway: %v"
 
@@ -167,7 +167,17 @@ func main() {
 	// Fediverse follower (an accepted inbound Follow), start federating that
 	// user's new posts and follows. It is never pinned to a specific user.
 	if nodeCli != nil {
-		g.onFollowed = newOutboundFederation(appCtx, nodeCli, g).start
+		of := newOutboundFederation(appCtx, nodeCli, g)
+		fed := newFederatedStore(envOr("GATEWAY_FEDERATED", "fediverse-gateway-federated.json"))
+		g.onFollowed = func(localUser string) {
+			fed.add(localUser)
+			of.start(localUser)
+		}
+		// Resume federation for users that gained a follower in earlier runs — the
+		// started map is in-memory, so a restart otherwise silently stops polling.
+		for _, u := range fed.list() {
+			of.start(u)
+		}
 	}
 
 	srv := &http.Server{

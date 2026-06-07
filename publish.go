@@ -67,7 +67,9 @@ func (g *gateway) publishNote(ctx context.Context, localUser string, t tweet) {
 			}
 			if perr := g.postSigned(ctx, localUser, inbox, create); perr != nil {
 				log.Errorf("publish: deliver tweet %s to %s: %v", t.Id, inbox, perr)
+				return
 			}
+			log.Infof("publish: delivered tweet %s to %s", t.Id, inbox)
 		}(actorURL)
 	}
 	wg.Wait()
