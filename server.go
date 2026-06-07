@@ -278,7 +278,7 @@ func (g *gateway) serveOutbox(w http.ResponseWriter, user string) {
 	}
 	items := make([]any, 0, len(resp.Tweets))
 	for _, t := range resp.Tweets {
-		if t.RetweetedBy != nil { // only the user's own posts
+		if !publishableTweet(t, user) { // own original top-level posts, matching outbound federation
 			continue
 		}
 		items = append(items, g.buildCreateNote(user, t))
