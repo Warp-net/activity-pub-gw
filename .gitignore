@@ -9,6 +9,10 @@
 # Test binary, built with `go test -c`
 *.test
 
+# Built gateway binary (`go build ./...` / `go build .` at the module root)
+/activity-pub-gw
+/fediverse-gateway
+
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
