@@ -34,14 +34,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	camouflage "github.com/Warp-net/libp2p-camouflage-transport"
 	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	p2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/pnet"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	noise "github.com/libp2p/go-libp2p/p2p/security/noise"
 	log "github.com/sirupsen/logrus"
 )
@@ -51,20 +54,20 @@ var (
 	errNoEntryReachable = errors.New("nodeclient: no Warpnet entry peer reachable")
 )
 
-// nodeClient is the gateway's libp2p connection into the Warpnet network: a
-// plain libp2p host (warpnet's PSK / camouflage transport / noise) that joins
-// through the network's bootstrap nodes and routes requests to whichever entry
-// peer answers. It is agnostic to any specific node — the public routes relay to
-// the owning node — so the gateway stores no node/profile state.
+// nodeClient joins the Warpnet DHT through the network's relays and streams the
+// /public/... routes to the member nodes it discovers via the DHT.
 type nodeClient struct {
-	h     host.Host
-	priv  ed25519.PrivateKey
-	peers []peer.ID
+	h      host.Host
+	priv   ed25519.PrivateKey
+	dht    *dht.IpfsDHT
+	relays map[peer.ID]struct{} // entry peers (relays): discovery/connectivity only, not data routes
+
+	mu   sync.Mutex
+	good []peer.ID // member nodes known to answer data routes; tried first
 }
 
-// networkEntries are the peers the gateway uses to enter Warpnet: the network's
-// bootstrap nodes plus an optional explicit GATEWAY_NODE_ADDR. None is
-// privileged — any one is just an entry point.
+// networkEntries are the network's bootstrap relays (the DHT entry points) plus
+// an optional explicit GATEWAY_NODE_ADDR.
 func networkEntries(network string) ([]peer.AddrInfo, error) {
 	var entries []peer.AddrInfo
 	for _, s := range bootstrapByNetwork[network] {
@@ -124,41 +127,85 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 		return nil, fmt.Errorf("nodeclient: new host: %w", err)
 	}
 
-	var peers []peer.ID
+	// Join Warpnet's Kademlia DHT (prefix "/<network>", bootstrapped via the relays).
+	kdht, err := dht.New(ctx, h,
+		dht.Mode(dht.ModeClient),
+		dht.ProtocolPrefix(protocol.ID("/"+network)),
+		dht.BootstrapPeers(entries...),
+	)
+	if err != nil {
+		_ = h.Close()
+		return nil, fmt.Errorf("nodeclient: dht: %w", err)
+	}
+
+	relays := make(map[peer.ID]struct{}, len(entries))
+	var connected int
 	for _, e := range entries {
+		relays[e.ID] = struct{}{}
 		if cerr := h.Connect(ctx, e); cerr != nil {
 			log.Warnf("nodeclient: connect %s: %v", e.ID, cerr)
 			continue
 		}
-		peers = append(peers, e.ID)
+		connected++
 	}
-	if len(peers) == 0 {
+	if connected == 0 {
+		_ = kdht.Close()
 		_ = h.Close()
 		return nil, errNoEntryReachable
 	}
-	log.Infof("nodeclient: joined Warpnet (%s) via %d entry peer(s)", network, len(peers))
 
-	return &nodeClient{h: h, priv: priv, peers: peers}, nil
+	if berr := kdht.Bootstrap(ctx); berr != nil {
+		log.Warnf("nodeclient: dht bootstrap: %v", berr)
+	}
+	select {
+	case <-kdht.RefreshRoutingTable():
+	case <-time.After(20 * time.Second):
+	case <-ctx.Done():
+	}
+	log.Infof("nodeclient: joined Warpnet (%s) via %d relay(s); discovering members via DHT", network, connected)
+
+	return &nodeClient{h: h, priv: priv, dht: kdht, relays: relays}, nil
 }
 
-// request streams to entry peers in turn until one answers; the public handlers
-// relay to the owning node, so any reachable peer can serve the route.
+// request streams the route to the member nodes discovered via the DHT, trying
+// each until one answers (relays serve only discovery, so they are excluded).
 func (c *nodeClient) request(route string, payload any) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
+
+	peers := c.memberCandidates()
+	if len(peers) == 0 && c.dht != nil {
+		select { // routing table not populated yet — refresh and retry
+		case <-c.dht.RefreshRoutingTable():
+		case <-time.After(15 * time.Second):
+		case <-ctx.Done():
+		}
+		peers = c.memberCandidates()
+	}
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("nodeclient: %s: no Warpnet member nodes discovered yet", route)
+	}
+
 	var lastErr error
-	for _, p := range c.peers {
-		bt, err := streamSend(ctx, c.h, p, c.priv, route, payload)
+	for _, p := range peers {
+		bt, err := c.streamToMember(ctx, p, route, payload)
 		if err == nil {
+			c.remember(p)
 			return bt, nil
 		}
 		lastErr = err
 	}
-	return nil, fmt.Errorf("nodeclient: %s failed on all entry peers: %w", route, lastErr)
+	return nil, fmt.Errorf("nodeclient: %s failed on all member nodes: %w", route, lastErr)
 }
 
 func (c *nodeClient) close() {
-	if c != nil && c.h != nil {
+	if c == nil {
+		return
+	}
+	if c.dht != nil {
+		_ = c.dht.Close()
+	}
+	if c.h != nil {
 		_ = c.h.Close()
 	}
 }
