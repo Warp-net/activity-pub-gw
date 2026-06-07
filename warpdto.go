@@ -27,127 +27,53 @@ resulting from the use or misuse of this software.
 
 package main
 
-// Wire DTOs copied from warpnet's domain/event packages so the gateway depends
-// only on the protocol's JSON shapes, not on the warpnet Go packages. These are
-// minimal subsets — JSON tags match the node exactly; unread fields are omitted.
+// The gateway's wire contract is now warpnet's own: route protocol IDs come
+// from event.PUBLIC_*, and payloads/responses are warpnet's event/domain types
+// (aliased to the gateway's local names so call sites stay terse). domain.ID is
+// a string alias, so these are byte-for-byte the shapes the node speaks.
 
 import (
-	"encoding/json"
-	"time"
+	"github.com/Warp-net/warpnet/domain"
+	"github.com/Warp-net/warpnet/event"
 )
 
-// Warpnet public-route protocol IDs (each is also the libp2p protocol string).
+// Public-route protocol IDs (each is also the libp2p protocol string).
 const (
-	routeGetUser       = "/public/get/user/0.0.0"
-	routeGetTweet      = "/public/get/tweet/0.0.0"
-	routeGetTweets     = "/public/get/tweets/0.0.0"
-	routeGetFollowers  = "/public/get/followers/0.0.0"
-	routeGetFollowings = "/public/get/followings/0.0.0"
-	routeGetImage      = "/public/get/image/0.0.0"
-	routePostFollow    = "/public/post/follow/0.0.0"
-	routePostUnfollow  = "/public/post/unfollow/0.0.0"
-	routePostLike      = "/public/post/like/0.0.0"
-	routePostUnlike    = "/public/post/unlike/0.0.0"
-	routePostRetweet   = "/public/post/retweet/0.0.0"
-	routePostUnretweet = "/public/post/unretweet/0.0.0"
-	routePostReply     = "/public/post/reply/0.0.0"
+	routeGetUser       = event.PUBLIC_GET_USER
+	routeGetTweet      = event.PUBLIC_GET_TWEET
+	routeGetTweets     = event.PUBLIC_GET_TWEETS
+	routeGetFollowers  = event.PUBLIC_GET_FOLLOWERS
+	routeGetFollowings = event.PUBLIC_GET_FOLLOWINGS
+	routeGetImage      = event.PUBLIC_GET_IMAGE
+	routePostFollow    = event.PUBLIC_POST_FOLLOW
+	routePostUnfollow  = event.PUBLIC_POST_UNFOLLOW
+	routePostLike      = event.PUBLIC_POST_LIKE
+	routePostUnlike    = event.PUBLIC_POST_UNLIKE
+	routePostRetweet   = event.PUBLIC_POST_RETWEET
+	routePostUnretweet = event.PUBLIC_POST_UNRETWEET
+	routePostReply     = event.PUBLIC_POST_REPLY
 )
 
-// message is the signed stream envelope (warpnet's event.Message).
-type message struct {
-	Body        json.RawMessage `json:"body"`
-	MessageId   string          `json:"message_id"`
-	NodeId      string          `json:"node_id"`
-	Destination string          `json:"path"`
-	Timestamp   time.Time       `json:"timestamp"`
-	Version     string          `json:"version"`
-	Signature   string          `json:"signature"`
-}
+// Wire envelope + domain payloads (warpnet's own types).
+type (
+	message = event.Message
+	tweet   = domain.Tweet
+	user    = domain.User
+)
 
-// tweet is the subset of domain.Tweet the gateway reads and writes. The retweet
-// route also takes a Tweet, so this doubles as the new-retweet payload.
-type tweet struct {
-	CreatedAt   time.Time `json:"created_at"`
-	Id          string    `json:"id"`
-	ParentId    *string   `json:"parent_id,omitempty"`
-	RetweetedBy *string   `json:"retweeted_by,omitempty"`
-	RootId      string    `json:"root_id"`
-	Text        string    `json:"text"`
-	UserId      string    `json:"user_id"`
-	ImageKeys   []string  `json:"image_keys,omitempty"`
-}
-
-// user is the subset of domain.User the gateway renders into an actor.
-type user struct {
-	Id       string `json:"id"`
-	Username string `json:"username"`
-	Bio      string `json:"bio"`
-}
-
-type getUserEvent struct {
-	UserId string `json:"user_id"`
-}
-
-type getTweetEvent struct {
-	TweetId string `json:"tweet_id"`
-	UserId  string `json:"user_id"`
-}
-
-type getAllTweetsEvent struct {
-	UserId string `json:"user_id"`
-}
-
-type tweetsResponse struct {
-	Tweets []tweet `json:"tweets"`
-}
-
-// getFollowersEvent is also used for the followings route (same shape).
-type getFollowersEvent struct {
-	UserId string `json:"user_id"`
-}
-
-type followersResponse struct {
-	Followers []string `json:"followers"`
-}
-
-type followingsResponse struct {
-	Followings []string `json:"followings"`
-}
-
-// newFollowEvent is also the unfollow payload (same shape).
-type newFollowEvent struct {
-	FollowerId  string `json:"follower_id"`
-	FollowingId string `json:"following_id"`
-}
-
-// likeEvent is also the unlike payload (same shape).
-type likeEvent struct {
-	TweetId string `json:"tweet_id"`
-	UserId  string `json:"user_id"`
-	OwnerId string `json:"owner_id"`
-}
-
-type unretweetEvent struct {
-	TweetId     string `json:"tweet_id"`
-	RetweeterId string `json:"retweeter_id"`
-}
-
-type newReplyEvent struct {
-	CreatedAt    time.Time `json:"created_at"`
-	Id           string    `json:"id"`
-	ParentId     *string   `json:"parent_id,omitempty"`
-	ParentUserId string    `json:"parent_user_id"`
-	RootId       string    `json:"root_id"`
-	Text         string    `json:"text"`
-	UserId       string    `json:"user_id"`
-	Username     string    `json:"username"`
-}
-
-type getImageEvent struct {
-	UserId string `json:"user_id"`
-	Key    string `json:"key"`
-}
-
-type getImageResponse struct {
-	File string `json:"file"`
-}
+// Request/response event payloads (warpnet's own types).
+type (
+	getUserEvent       = event.GetUserEvent
+	getTweetEvent      = event.GetTweetEvent
+	getAllTweetsEvent  = event.GetAllTweetsEvent
+	tweetsResponse     = event.TweetsResponse
+	getFollowersEvent  = event.GetAllTweetsEvent // {user_id, cursor}; same shape for followers/followings
+	followersResponse  = event.FollowersResponse
+	followingsResponse = event.FollowingsResponse
+	newFollowEvent     = event.NewFollowEvent
+	likeEvent          = event.LikeEvent
+	unretweetEvent     = event.UnretweetEvent
+	newReplyEvent      = event.NewReplyEvent
+	getImageEvent      = event.GetImageEvent
+	getImageResponse   = event.GetImageResponse
+)

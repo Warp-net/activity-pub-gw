@@ -71,6 +71,7 @@ type actor struct {
 	PreferredUsername string          `json:"preferredUsername"`
 	Name              string          `json:"name,omitempty"`
 	Summary           string          `json:"summary,omitempty"`
+	Icon              *attachment     `json:"icon,omitempty"`
 	Inbox             string          `json:"inbox"`
 	Outbox            string          `json:"outbox"`
 	Followers         string          `json:"followers"`

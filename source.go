@@ -33,6 +33,7 @@ type warpnetUser struct {
 	PreferredUsername string
 	DisplayName       string
 	Summary           string
+	Avatar            string // domain.User.AvatarKey ("<mime>,<base64>"); empty if none
 }
 
 // warpnetSource resolves the Warpnet user a given actor handle maps to.

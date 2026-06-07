@@ -37,7 +37,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	camouflage "github.com/Warp-net/libp2p-camouflage-transport"
+	"github.com/Warp-net/warpnet/security"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	p2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -109,9 +111,20 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 		return nil, fmt.Errorf("nodeclient: key: %w", err)
 	}
 
+	// PSK keys the private network on the network name + MAJOR version (warpnet's
+	// security.GeneratePSK); major 0 matches the live networks.
+	ver, err := semver.NewVersion("0.0.0")
+	if err != nil {
+		return nil, fmt.Errorf("nodeclient: version: %w", err)
+	}
+	psk, err := security.GeneratePSK(network, ver)
+	if err != nil {
+		return nil, fmt.Errorf("nodeclient: psk: %w", err)
+	}
+
 	h, err := libp2p.New(
 		libp2p.Identity(p2pPriv),
-		libp2p.PrivateNetwork(pnet.PSK(generatePSK(network))),
+		libp2p.PrivateNetwork(pnet.PSK(psk)),
 		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
 		libp2p.WithDialTimeout(60*time.Second),
 		libp2p.Transport(camouflage.NewCamouflageTransport),
@@ -232,6 +245,7 @@ func (s nodeSource) GetUser(preferredUsername string) (warpnetUser, bool) {
 		PreferredUsername: u.Id,
 		DisplayName:       u.Username,
 		Summary:           u.Bio,
+		Avatar:            u.AvatarKey,
 	}, true
 }
 

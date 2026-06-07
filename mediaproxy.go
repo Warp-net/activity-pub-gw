@@ -95,3 +95,44 @@ func (g *gateway) handleMedia(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(headerContentType, mime)
 	_, _ = w.Write(bytes)
 }
+
+// handleAvatar serves a Warpnet user's avatar as the actor icon. The avatar is
+// inline in the user object (domain.User.AvatarKey, "<mime>,<base64>"), so it is
+// fetched via PUBLIC_GET_USER rather than the image route. The gateway stores
+// nothing.
+func (g *gateway) handleAvatar(w http.ResponseWriter, r *http.Request) {
+	if g.req == nil {
+		http.Error(w, "no node", http.StatusServiceUnavailable)
+		return
+	}
+	userID := strings.TrimPrefix(r.URL.Path, pathAvatar)
+	if userID == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	bt, err := g.req.request(routeGetUser, getUserEvent{UserId: userID})
+	if err != nil {
+		log.Errorf("avatar: fetch %s: %v", userID, err)
+		http.Error(w, "fetch failed", http.StatusBadGateway)
+		return
+	}
+	var u user
+	if jerr := json.Unmarshal(bt, &u); jerr != nil || u.AvatarKey == "" {
+		http.NotFound(w, r)
+		return
+	}
+	mime, data, found := strings.Cut(u.AvatarKey, ",")
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+	raw, derr := base64.StdEncoding.DecodeString(data)
+	if derr != nil {
+		log.Errorf("avatar: decode %s: %v", userID, derr)
+		http.Error(w, "decode failed", http.StatusBadGateway)
+		return
+	}
+	w.Header().Set(headerContentType, mime)
+	_, _ = w.Write(raw)
+}

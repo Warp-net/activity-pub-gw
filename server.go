@@ -68,6 +68,7 @@ const (
 	pathFollowers = "/followers"
 	pathStatuses  = "/statuses/"
 	pathMedia     = "/media/"
+	pathAvatar    = "/avatar/"
 
 	headerContentType = "Content-Type"
 )
@@ -113,6 +114,7 @@ func (g *gateway) routes() *http.ServeMux {
 	mux.HandleFunc(pathUsers, g.handleUsers)
 	mux.HandleFunc(pathInbox, g.handleSharedInbox)
 	mux.HandleFunc(pathMedia, g.handleMedia)
+	mux.HandleFunc(pathAvatar, g.handleAvatar)
 	return mux
 }
 
@@ -160,11 +162,11 @@ func (g *gateway) handleUsers(w http.ResponseWriter, r *http.Request) {
 	case "inbox":
 		g.handleInbox(w, r, user)
 	case "outbox":
-		g.serveEmptyCollection(w, g.actorID(user)+"/outbox")
+		g.serveOutbox(w, user)
 	case "followers":
 		g.serveFollowers(w, user)
 	case "following":
-		g.serveEmptyCollection(w, g.actorID(user)+"/following")
+		g.serveFollowing(w, user)
 	case "statuses":
 		if len(parts) < 3 || parts[2] == "" {
 			http.NotFound(w, r)
@@ -178,7 +180,7 @@ func (g *gateway) handleUsers(w http.ResponseWriter, r *http.Request) {
 
 func (g *gateway) serveActor(w http.ResponseWriter, wu warpnetUser) {
 	id := g.actorID(wu.PreferredUsername)
-	writeJSON(w, contentTypeAP, actor{
+	a := actor{
 		Context:           []string{asContext, secContext},
 		ID:                id,
 		Type:              "Person",
@@ -195,7 +197,11 @@ func (g *gateway) serveActor(w http.ResponseWriter, wu warpnetUser) {
 			PublicKeyPEM: g.keyPubPEM,
 		},
 		Endpoints: &actorEndpoints{SharedInbox: g.baseURL() + pathInbox},
-	})
+	}
+	if wu.Avatar != "" {
+		a.Icon = &attachment{Type: "Image", URL: g.baseURL() + pathAvatar + wu.PreferredUsername}
+	}
+	writeJSON(w, contentTypeAP, a)
 }
 
 func (g *gateway) serveEmptyCollection(w http.ResponseWriter, id string) {
@@ -220,6 +226,77 @@ func (g *gateway) serveFollowers(w http.ResponseWriter, user string) {
 	writeJSON(w, contentTypeAP, orderedCollection{
 		Context:      asContext,
 		ID:           g.actorID(user) + pathFollowers,
+		Type:         "OrderedCollection",
+		TotalItems:   len(items),
+		OrderedItems: items,
+	})
+}
+
+// serveOutbox renders the user's Warpnet posts (PUBLIC_GET_TWEETS) as an
+// OrderedCollection of Create(Note) so they appear on the Mastodon profile.
+func (g *gateway) serveOutbox(w http.ResponseWriter, user string) {
+	id := g.actorID(user) + "/outbox"
+	if g.req == nil {
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	bt, err := g.req.request(routeGetTweets, getAllTweetsEvent{UserId: user})
+	if err != nil {
+		log.Warnf("outbox: fetch %s: %v", user, err)
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	var resp tweetsResponse
+	if jerr := json.Unmarshal(bt, &resp); jerr != nil {
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	items := make([]any, 0, len(resp.Tweets))
+	for _, t := range resp.Tweets {
+		if t.RetweetedBy != nil { // only the user's own posts
+			continue
+		}
+		items = append(items, g.buildCreateNote(user, t))
+	}
+	writeJSON(w, contentTypeAP, orderedCollection{
+		Context:      asContext,
+		ID:           id,
+		Type:         "OrderedCollection",
+		TotalItems:   len(items),
+		OrderedItems: items,
+	})
+}
+
+// serveFollowing renders who the user follows (PUBLIC_GET_FOLLOWINGS): fediverse
+// follows resolve to their actor URL, Warpnet follows to their gateway actor.
+func (g *gateway) serveFollowing(w http.ResponseWriter, user string) {
+	id := g.actorID(user) + "/following"
+	if g.req == nil {
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	bt, err := g.req.request(routeGetFollowings, getFollowersEvent{UserId: user})
+	if err != nil {
+		log.Warnf("following: fetch %s: %v", user, err)
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	var resp followingsResponse
+	if jerr := json.Unmarshal(bt, &resp); jerr != nil {
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	items := make([]any, 0, len(resp.Followings))
+	for _, fid := range resp.Followings {
+		if url, derr := decodeActorID(fid); derr == nil {
+			items = append(items, url)
+		} else {
+			items = append(items, g.actorID(fid))
+		}
+	}
+	writeJSON(w, contentTypeAP, orderedCollection{
+		Context:      asContext,
+		ID:           id,
 		Type:         "OrderedCollection",
 		TotalItems:   len(items),
 		OrderedItems: items,
