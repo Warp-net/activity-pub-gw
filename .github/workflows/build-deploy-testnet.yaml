@@ -52,10 +52,13 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           eval "$(ssh-agent -s)"
           ssh-add ~/.ssh/id_rsa
-          ssh-keyscan -H 207.154.221.44 >> ~/.ssh/known_hosts
+          # Best-effort: a keyscan hiccup must not gate the deploy (the scp/ssh
+          # below verify the host on connect). Without this, a single timeout
+          # exits non-zero and bash -e fails the whole job.
+          ssh-keyscan -H -T 15 207.154.221.44 >> ~/.ssh/known_hosts || true
 
       - name: Deploy to Testnet DO Droplet
         run: |
-          scp ./deploy/deploy.sh root@207.154.221.44:/root
-          scp ./deploy/docker-compose-testnet.yml root@207.154.221.44:/root/docker-compose-testnet.yml
-          ssh root@207.154.221.44 'GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} TS_AUTHKEY=${{ secrets.TS_AUTHKEY }} bash /root/deploy.sh'
+          scp -o StrictHostKeyChecking=accept-new ./deploy/deploy.sh root@207.154.221.44:/root
+          scp -o StrictHostKeyChecking=accept-new ./deploy/docker-compose-testnet.yml root@207.154.221.44:/root/docker-compose-testnet.yml
+          ssh -o StrictHostKeyChecking=accept-new root@207.154.221.44 'GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} TS_AUTHKEY=${{ secrets.TS_AUTHKEY }} bash /root/deploy.sh'
