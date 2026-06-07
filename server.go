@@ -68,8 +68,6 @@ const (
 	pathFollowers = "/followers"
 	pathStatuses  = "/statuses/"
 	pathMedia     = "/media/"
-	pathAvatar    = "/avatar/"
-	pathHeader    = "/header/"
 
 	headerContentType = "Content-Type"
 )
@@ -115,8 +113,6 @@ func (g *gateway) routes() *http.ServeMux {
 	mux.HandleFunc(pathUsers, g.handleUsers)
 	mux.HandleFunc(pathInbox, g.handleSharedInbox)
 	mux.HandleFunc(pathMedia, g.handleMedia)
-	mux.HandleFunc(pathAvatar, g.handleAvatar)
-	mux.HandleFunc(pathHeader, g.handleHeader)
 	return mux
 }
 
@@ -205,10 +201,10 @@ func (g *gateway) serveActor(w http.ResponseWriter, wu warpnetUser) {
 		Endpoints: &actorEndpoints{SharedInbox: g.baseURL() + pathInbox},
 	}
 	if wu.Avatar != "" {
-		a.Icon = &attachment{Type: "Image", URL: g.baseURL() + pathAvatar + wu.PreferredUsername}
+		a.Icon = &attachment{Type: "Image", URL: g.baseURL() + pathMedia + encodeMediaRef(wu.PreferredUsername, wu.Avatar)}
 	}
 	if wu.Background != "" {
-		a.Image = &attachment{Type: "Image", URL: g.baseURL() + pathHeader + wu.PreferredUsername}
+		a.Image = &attachment{Type: "Image", URL: g.baseURL() + pathMedia + encodeMediaRef(wu.PreferredUsername, wu.Background)}
 	}
 	writeJSON(w, contentTypeAP, a)
 }
