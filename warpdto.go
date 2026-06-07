@@ -42,6 +42,7 @@ const (
 	routeGetUser       = event.PUBLIC_GET_USER
 	routeGetTweet      = event.PUBLIC_GET_TWEET
 	routeGetTweets     = event.PUBLIC_GET_TWEETS
+	routeGetReplies    = event.PUBLIC_GET_REPLIES
 	routeGetFollowers  = event.PUBLIC_GET_FOLLOWERS
 	routeGetFollowings = event.PUBLIC_GET_FOLLOWINGS
 	routeGetImage      = event.PUBLIC_GET_IMAGE
@@ -67,6 +68,7 @@ type (
 	getTweetEvent      = event.GetTweetEvent
 	getAllTweetsEvent  = event.GetAllTweetsEvent
 	tweetsResponse     = event.TweetsResponse
+	repliesResponse    = event.RepliesResponse
 	getFollowersEvent  = event.GetAllTweetsEvent // {user_id, cursor}; same shape for followers/followings
 	followersResponse  = event.FollowersResponse
 	followingsResponse = event.FollowingsResponse

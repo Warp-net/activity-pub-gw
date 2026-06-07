@@ -69,6 +69,7 @@ const (
 	pathStatuses  = "/statuses/"
 	pathMedia     = "/media/"
 	pathAvatar    = "/avatar/"
+	pathHeader    = "/header/"
 
 	headerContentType = "Content-Type"
 )
@@ -115,6 +116,7 @@ func (g *gateway) routes() *http.ServeMux {
 	mux.HandleFunc(pathInbox, g.handleSharedInbox)
 	mux.HandleFunc(pathMedia, g.handleMedia)
 	mux.HandleFunc(pathAvatar, g.handleAvatar)
+	mux.HandleFunc(pathHeader, g.handleHeader)
 	return mux
 }
 
@@ -172,6 +174,10 @@ func (g *gateway) handleUsers(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		if len(parts) >= 4 && parts[3] == "replies" {
+			g.serveReplies(w, user, parts[2])
+			return
+		}
 		g.serveStatus(w, r, user, parts[2])
 	default:
 		http.NotFound(w, r)
@@ -200,6 +206,9 @@ func (g *gateway) serveActor(w http.ResponseWriter, wu warpnetUser) {
 	}
 	if wu.Avatar != "" {
 		a.Icon = &attachment{Type: "Image", URL: g.baseURL() + pathAvatar + wu.PreferredUsername}
+	}
+	if wu.Background != "" {
+		a.Image = &attachment{Type: "Image", URL: g.baseURL() + pathHeader + wu.PreferredUsername}
 	}
 	writeJSON(w, contentTypeAP, a)
 }
@@ -293,6 +302,43 @@ func (g *gateway) serveFollowing(w http.ResponseWriter, user string) {
 		} else {
 			items = append(items, g.actorID(fid))
 		}
+	}
+	writeJSON(w, contentTypeAP, orderedCollection{
+		Context:      asContext,
+		ID:           id,
+		Type:         "OrderedCollection",
+		TotalItems:   len(items),
+		OrderedItems: items,
+	})
+}
+
+// serveReplies renders the replies to a Note (PUBLIC_GET_REPLIES) as an
+// OrderedCollection of Notes for thread context. Only Warpnet-authored replies
+// are inlined; fediverse replies (ap: ids) are omitted — Mastodon has its own.
+func (g *gateway) serveReplies(w http.ResponseWriter, user, tweetID string) {
+	id := g.actorID(user) + pathStatuses + tweetID + "/replies"
+	if g.req == nil {
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	bt, err := g.req.request(routeGetReplies, getTweetEvent{TweetId: tweetID, UserId: user})
+	if err != nil {
+		log.Warnf("replies: fetch %s/%s: %v", user, tweetID, err)
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	var resp repliesResponse
+	if jerr := json.Unmarshal(bt, &resp); jerr != nil {
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	items := make([]any, 0, len(resp.Replies))
+	for _, rn := range resp.Replies {
+		t := rn.Reply
+		if t.Id == "" || strings.HasPrefix(t.UserId, apFollowerPrefix) {
+			continue // skip fediverse-authored replies; Mastodon already has them
+		}
+		items = append(items, g.buildNote(t.UserId, t))
 	}
 	writeJSON(w, contentTypeAP, orderedCollection{
 		Context:      asContext,

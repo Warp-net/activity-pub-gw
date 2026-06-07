@@ -72,6 +72,7 @@ type actor struct {
 	Name              string          `json:"name,omitempty"`
 	Summary           string          `json:"summary,omitempty"`
 	Icon              *attachment     `json:"icon,omitempty"`
+	Image             *attachment     `json:"image,omitempty"`
 	Inbox             string          `json:"inbox"`
 	Outbox            string          `json:"outbox"`
 	Followers         string          `json:"followers"`
@@ -103,6 +104,7 @@ type note struct {
 	AttributedTo string       `json:"attributedTo"`
 	Content      string       `json:"content"`
 	Published    string       `json:"published"`
+	Replies      string       `json:"replies,omitempty"`
 	InReplyTo    string       `json:"inReplyTo,omitempty"`
 	To           []string     `json:"to,omitempty"`
 	Cc           []string     `json:"cc,omitempty"`

@@ -246,6 +246,7 @@ func (s nodeSource) GetUser(preferredUsername string) (warpnetUser, bool) {
 		DisplayName:       u.Username,
 		Summary:           u.Bio,
 		Avatar:            u.AvatarKey,
+		Background:        u.BackgroundImageKey,
 	}, true
 }
 

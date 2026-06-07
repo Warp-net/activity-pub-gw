@@ -96,16 +96,24 @@ func (g *gateway) handleMedia(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(bytes)
 }
 
-// handleAvatar serves a Warpnet user's avatar as the actor icon. The avatar is
-// inline in the user object (domain.User.AvatarKey, "<mime>,<base64>"), so it is
-// fetched via PUBLIC_GET_USER rather than the image route. The gateway stores
-// nothing.
+// handleAvatar / handleHeader serve a Warpnet user's profile images as the actor
+// icon and image. Both are inline in the user object (domain.User.AvatarKey /
+// BackgroundImageKey), so they are fetched via PUBLIC_GET_USER. The gateway
+// stores nothing.
 func (g *gateway) handleAvatar(w http.ResponseWriter, r *http.Request) {
+	g.serveUserImage(w, r, pathAvatar, func(u user) string { return u.AvatarKey })
+}
+
+func (g *gateway) handleHeader(w http.ResponseWriter, r *http.Request) {
+	g.serveUserImage(w, r, pathHeader, func(u user) string { return u.BackgroundImageKey })
+}
+
+func (g *gateway) serveUserImage(w http.ResponseWriter, r *http.Request, prefix string, pick func(user) string) {
 	if g.req == nil {
 		http.Error(w, "no node", http.StatusServiceUnavailable)
 		return
 	}
-	userID := strings.TrimPrefix(r.URL.Path, pathAvatar)
+	userID := strings.TrimPrefix(r.URL.Path, prefix)
 	if userID == "" {
 		http.NotFound(w, r)
 		return
@@ -113,26 +121,39 @@ func (g *gateway) handleAvatar(w http.ResponseWriter, r *http.Request) {
 
 	bt, err := g.req.request(routeGetUser, getUserEvent{UserId: userID})
 	if err != nil {
-		log.Errorf("avatar: fetch %s: %v", userID, err)
+		log.Errorf("image: fetch %s: %v", userID, err)
 		http.Error(w, "fetch failed", http.StatusBadGateway)
 		return
 	}
 	var u user
-	if jerr := json.Unmarshal(bt, &u); jerr != nil || u.AvatarKey == "" {
+	if jerr := json.Unmarshal(bt, &u); jerr != nil {
 		http.NotFound(w, r)
 		return
 	}
-	mime, data, found := strings.Cut(u.AvatarKey, ",")
-	if !found {
+	mime, raw, ok := decodeInlineImage(pick(u))
+	if !ok {
 		http.NotFound(w, r)
-		return
-	}
-	raw, derr := base64.StdEncoding.DecodeString(data)
-	if derr != nil {
-		log.Errorf("avatar: decode %s: %v", userID, derr)
-		http.Error(w, "decode failed", http.StatusBadGateway)
 		return
 	}
 	w.Header().Set(headerContentType, mime)
 	_, _ = w.Write(raw)
+}
+
+// decodeInlineImage parses Warpnet's inline image encoding, accepting both
+// "<mime>,<base64>" and the data-URI "data:<mime>;base64,<base64>" forms.
+func decodeInlineImage(s string) (mime string, data []byte, ok bool) {
+	meta, b64, found := strings.Cut(s, ",")
+	if !found || b64 == "" {
+		return "", nil, false
+	}
+	meta = strings.TrimPrefix(meta, "data:")
+	meta = strings.TrimSuffix(meta, ";base64")
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return "", nil, false
+	}
+	if meta == "" {
+		meta = "application/octet-stream"
+	}
+	return meta, raw, true
 }

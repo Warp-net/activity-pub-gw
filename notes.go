@@ -51,6 +51,7 @@ func (g *gateway) buildNote(localUser string, t tweet) note {
 		AttributedTo: actorID,
 		Content:      "<p>" + html.EscapeString(t.Text) + "</p>",
 		Published:    t.CreatedAt.UTC().Format(time.RFC3339),
+		Replies:      actorID + pathStatuses + t.Id + "/replies",
 		To:           []string{asPublic},
 		Cc:           []string{followers},
 	}
