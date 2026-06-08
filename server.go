@@ -259,15 +259,15 @@ func (g *gateway) serveFollowers(w http.ResponseWriter, user string) {
 
 // serveOutbox renders the user's Warpnet posts (PUBLIC_GET_TWEETS) as an
 // OrderedCollection of Create(Note) so they appear on the Mastodon profile.
-func (g *gateway) serveOutbox(w http.ResponseWriter, user string) {
-	id := g.actorID(user) + "/outbox"
+func (g *gateway) serveOutbox(w http.ResponseWriter, userID string) {
+	id := g.actorID(userID) + "/outbox"
 	if g.req == nil {
 		g.serveEmptyCollection(w, id)
 		return
 	}
-	bt, err := g.req.request(routeGetTweets, getAllTweetsEvent{UserId: user})
+	bt, err := g.req.request(routeGetTweets, getAllTweetsEvent{UserId: userID})
 	if err != nil {
-		log.Warnf("outbox: fetch %s: %v", user, err)
+		log.Warnf("outbox: fetch %s: %v", userID, err)
 		g.serveEmptyCollection(w, id)
 		return
 	}
@@ -278,16 +278,28 @@ func (g *gateway) serveOutbox(w http.ResponseWriter, user string) {
 	}
 	items := make([]any, 0, len(resp.Tweets))
 	for _, t := range resp.Tweets {
-		if !publishableTweet(t, user) { // own original top-level posts, matching outbound federation
+		if !publishableTweet(t, userID) { // own original top-level posts, matching outbound federation
 			continue
 		}
-		items = append(items, g.buildCreateNote(user, t))
+		items = append(items, g.buildCreateNote(userID, t))
 	}
+
+	// totalItems is the user's authoritative post count: GET_TWEETS is paginated,
+	// so the fetched page is only a slice — reporting its length as the total
+	// (e.g. the page size) understates the real count.
+	total := len(items)
+	if ub, uerr := g.req.request(routeGetUser, getUserEvent{UserId: userID}); uerr == nil {
+		var u user
+		if json.Unmarshal(ub, &u) == nil && u.TweetsCount > 0 {
+			total = int(u.TweetsCount)
+		}
+	}
+
 	writeJSON(w, contentTypeAP, orderedCollection{
 		Context:      asContext,
 		ID:           id,
 		Type:         "OrderedCollection",
-		TotalItems:   len(items),
+		TotalItems:   total,
 		OrderedItems: items,
 	})
 }
