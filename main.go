@@ -63,7 +63,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.16"
+const gatewayVersion = "0.1.17"
 
 const fatalFmt = "gateway: %v"
 
@@ -71,6 +71,7 @@ func main() {
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true, TimestampFormat: time.DateTime})
 	log.SetOutput(os.Stdout)
 	log.SetLevel(log.InfoLevel)
+	log.Infof("gateway: starting version %s", gatewayVersion)
 
 	// Smoke-test the libp2p connector against the configured Warpnet node.
 	if envOr("GATEWAY_PROBE", "") != "" {
