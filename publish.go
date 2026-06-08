@@ -44,6 +44,7 @@ func (g *gateway) publishNote(ctx context.Context, localUser string, t tweet) {
 		return
 	}
 	if len(actorURLs) == 0 {
+		log.Infof("publish: tweet %s: %s has no Fediverse followers, skipping", t.Id, localUser)
 		return
 	}
 	create := g.buildCreateNote(localUser, t)

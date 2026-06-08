@@ -47,6 +47,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/pnet"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	noise "github.com/libp2p/go-libp2p/p2p/security/noise"
 	log "github.com/sirupsen/logrus"
 )
@@ -122,7 +123,16 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 		return nil, fmt.Errorf("nodeclient: psk: %w", err)
 	}
 
+	// No resource-manager limits: the whole testnet shares one IP, so the default
+	// per-IP connection cap blocks the gateway from reaching the member node and
+	// makes resolution/federation flaky.
+	rm, err := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(rcmgr.InfiniteLimits))
+	if err != nil {
+		return nil, fmt.Errorf("nodeclient: resource manager: %w", err)
+	}
+
 	h, err := libp2p.New(
+		libp2p.ResourceManager(rm),
 		libp2p.Identity(p2pPriv),
 		libp2p.PrivateNetwork(pnet.PSK(psk)),
 		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
