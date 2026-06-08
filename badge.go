@@ -84,6 +84,6 @@ func warpnetNetworkField() propertyValue {
 	return propertyValue{
 		Type:  "PropertyValue",
 		Name:  "Network",
-		Value: `<a href="https://github.com/Warp-net/warpnet" rel="nofollow noopener" target="_blank">Warpnet</a> — decentralized P2P`,
+		Value: `<a href="https://warpnet.site" rel="nofollow noopener" target="_blank">Warpnet</a>`,
 	}
 }
