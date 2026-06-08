@@ -32,8 +32,12 @@ import (
 )
 
 // nodeRequester is the subset of nodeClient that the follower store needs.
+// requestUser targets the node that owns userID (for routes that are
+// authoritative only there, e.g. follows/followers); request broadcasts to any
+// member node (for replicated routes and as the owner-resolution fallback).
 type nodeRequester interface {
 	request(route string, payload any) ([]byte, error)
+	requestUser(userID, route string, payload any) ([]byte, error)
 }
 
 // nodeFollowerStore keeps the AP follow graph in Warpnet by reusing the
@@ -46,7 +50,7 @@ type nodeFollowerStore struct {
 }
 
 func (s nodeFollowerStore) Add(localUser, actorURL string) error {
-	_, err := s.req.request(routePostFollow, newFollowEvent{
+	_, err := s.req.requestUser(localUser, routePostFollow, newFollowEvent{
 		FollowerId:  encodeActorID(actorURL),
 		FollowingId: localUser,
 	})
@@ -54,7 +58,7 @@ func (s nodeFollowerStore) Add(localUser, actorURL string) error {
 }
 
 func (s nodeFollowerStore) List(localUser string) ([]string, error) {
-	bt, err := s.req.request(routeGetFollowers, getFollowersEvent{UserId: localUser})
+	bt, err := s.req.requestUser(localUser, routeGetFollowers, getFollowersEvent{UserId: localUser})
 	if err != nil {
 		return nil, err
 	}

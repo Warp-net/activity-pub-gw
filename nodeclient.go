@@ -65,8 +65,9 @@ type nodeClient struct {
 	dht    *dht.IpfsDHT
 	relays map[peer.ID]struct{} // entry peers (relays): discovery/connectivity only, not data routes
 
-	mu   sync.Mutex
-	good []peer.ID // member nodes known to answer data routes; tried first
+	mu    sync.Mutex
+	good  []peer.ID          // member nodes known to answer data routes; tried first
+	owner map[string]peer.ID // userID -> its home node (domain.User.NodeId); user-scoped routes target it
 }
 
 // networkEntries are the network's bootstrap relays (the DHT entry points) plus
@@ -188,7 +189,7 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 	}
 	log.Infof("nodeclient: joined Warpnet (%s) via %d relay(s); discovering members via DHT", network, connected)
 
-	return &nodeClient{h: h, priv: priv, dht: kdht, relays: relays}, nil
+	return &nodeClient{h: h, priv: priv, dht: kdht, relays: relays, owner: map[string]peer.ID{}}, nil
 }
 
 // request streams the route to the member nodes discovered via the DHT, trying
@@ -220,6 +221,66 @@ func (c *nodeClient) request(route string, payload any) ([]byte, error) {
 		lastErr = err
 	}
 	return nil, fmt.Errorf("nodeclient: %s failed on all member nodes: %w", route, lastErr)
+}
+
+// requestUser streams a user-scoped route directly to the node that OWNS userID
+// (its domain.User.NodeId). Routes like POST_FOLLOW and GET_FOLLOWERS are
+// authoritative only on the owner node: a random member node silently "accepts"
+// a follow without persisting it and reads back an empty follower list, which
+// made federation depend on which node the DHT happened to answer with. Falls
+// back to the broadcast request when the owner can't be resolved or reached.
+func (c *nodeClient) requestUser(userID, route string, payload any) ([]byte, error) {
+	if owner, ok := c.ownerNode(userID); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		bt, err := c.streamToMember(ctx, owner, route, payload)
+		cancel()
+		if err == nil {
+			c.remember(owner)
+			return bt, nil
+		}
+		log.Warnf("nodeclient: %s on owner of %s failed, falling back to broadcast: %v", route, userID, err)
+		c.forgetOwner(userID)
+	}
+	return c.request(route, payload)
+}
+
+// ownerNode resolves userID's home node from domain.User.NodeId (via GET_USER,
+// which any node can answer because profiles are replicated; the node_id it
+// carries is the user's authoritative node regardless of who replied) and
+// caches it.
+func (c *nodeClient) ownerNode(userID string) (peer.ID, bool) {
+	c.mu.Lock()
+	p, ok := c.owner[userID]
+	c.mu.Unlock()
+	if ok {
+		return p, true
+	}
+
+	bt, err := c.request(routeGetUser, getUserEvent{UserId: userID})
+	if err != nil {
+		return "", false
+	}
+	var u user
+	if json.Unmarshal(bt, &u) != nil || u.NodeId == "" {
+		return "", false
+	}
+	p, err = peer.Decode(u.NodeId)
+	if err != nil {
+		log.Warnf("nodeclient: bad node_id %q for %s: %v", u.NodeId, userID, err)
+		return "", false
+	}
+	c.mu.Lock()
+	c.owner[userID] = p
+	c.mu.Unlock()
+	return p, true
+}
+
+// forgetOwner drops a cached owner mapping so the next user-scoped request
+// re-resolves it (e.g. after the owner node moved or went briefly unreachable).
+func (c *nodeClient) forgetOwner(userID string) {
+	c.mu.Lock()
+	delete(c.owner, userID)
+	c.mu.Unlock()
 }
 
 func (c *nodeClient) close() {

@@ -243,6 +243,10 @@ func (f *fakeRequester) request(route string, payload any) ([]byte, error) {
 	return []byte(`["accepted"]`), nil
 }
 
+func (f *fakeRequester) requestUser(_, route string, payload any) ([]byte, error) {
+	return f.request(route, payload)
+}
+
 func TestNodeFollowerStore(t *testing.T) {
 	const actor = "https://mastodon.social/users/bob"
 	fr := &fakeRequester{}
@@ -308,6 +312,10 @@ func (f *fakeTweetsRequester) request(route string, _ any) ([]byte, error) {
 		return bt, nil
 	}
 	return []byte(`["accepted"]`), nil
+}
+
+func (f *fakeTweetsRequester) requestUser(_, route string, payload any) ([]byte, error) {
+	return f.request(route, payload)
 }
 
 func TestTweetPollerSeedAndDedup(t *testing.T) {

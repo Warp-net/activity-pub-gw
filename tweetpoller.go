@@ -98,7 +98,7 @@ func (p *tweetPoller) poll(ctx context.Context) {
 }
 
 func (p *tweetPoller) fetch() []tweet {
-	bt, err := p.req.request(routeGetTweets, getAllTweetsEvent{UserId: p.owner})
+	bt, err := p.req.requestUser(p.owner, routeGetTweets, getAllTweetsEvent{UserId: p.owner})
 	if err != nil {
 		log.Errorf("poller: get tweets for %s: %v", p.owner, err)
 		return nil

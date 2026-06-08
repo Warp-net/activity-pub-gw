@@ -265,7 +265,7 @@ func (g *gateway) serveOutbox(w http.ResponseWriter, userID string) {
 		g.serveEmptyCollection(w, id)
 		return
 	}
-	bt, err := g.req.request(routeGetTweets, getAllTweetsEvent{UserId: userID})
+	bt, err := g.req.requestUser(userID, routeGetTweets, getAllTweetsEvent{UserId: userID})
 	if err != nil {
 		log.Warnf("outbox: fetch %s: %v", userID, err)
 		g.serveEmptyCollection(w, id)
@@ -312,7 +312,7 @@ func (g *gateway) serveFollowing(w http.ResponseWriter, user string) {
 		g.serveEmptyCollection(w, id)
 		return
 	}
-	bt, err := g.req.request(routeGetFollowings, getFollowersEvent{UserId: user})
+	bt, err := g.req.requestUser(user, routeGetFollowings, getFollowersEvent{UserId: user})
 	if err != nil {
 		log.Warnf("following: fetch %s: %v", user, err)
 		g.serveEmptyCollection(w, id)
@@ -349,7 +349,7 @@ func (g *gateway) serveReplies(w http.ResponseWriter, user, tweetID string) {
 		g.serveEmptyCollection(w, id)
 		return
 	}
-	bt, err := g.req.request(routeGetReplies, getTweetEvent{TweetId: tweetID, UserId: user})
+	bt, err := g.req.requestUser(user, routeGetReplies, getTweetEvent{TweetId: tweetID, UserId: user})
 	if err != nil {
 		log.Warnf("replies: fetch %s/%s: %v", user, tweetID, err)
 		g.serveEmptyCollection(w, id)
