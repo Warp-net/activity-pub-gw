@@ -63,7 +63,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.13"
+const gatewayVersion = "0.1.14"
 
 const fatalFmt = "gateway: %v"
 
@@ -136,21 +136,21 @@ func main() {
 		log.Infoln("gateway: joined Warpnet; any user is resolvable via the network")
 	}
 
-	// The gateway durably owns its Fediverse follower list in a local store
-	// (persisted in /data, surviving redeploys). When a node is connected, each
-	// follow is also mirrored into Warpnet best-effort so the owner node reflects
-	// it — but delivery reads from the local store, so federating a post never
-	// depends on Warpnet's follow-graph routing.
-	ff, ferr := newFileFollowerStore(followersPath)
-	if ferr != nil {
-		appCancel()
-		log.Fatalf(fatalFmt, ferr)
-	}
-	var followers followerStore = ff
+	// The follower graph lives in Warpnet, read/written through the owner member
+	// node via the node connector (owner-targeted routes). Only when no node is
+	// configured does the gateway fall back to a local dev store.
+	var followers followerStore
 	var req nodeRequester
 	if nodeCli != nil {
-		followers = dualFollowerStore{local: ff, remote: nodeFollowerStore{req: nodeCli}}
+		followers = nodeFollowerStore{req: nodeCli}
 		req = nodeCli
+	} else {
+		ff, ferr := newFileFollowerStore(followersPath)
+		if ferr != nil {
+			appCancel()
+			log.Fatalf(fatalFmt, ferr)
+		}
+		followers = ff
 	}
 
 	g := &gateway{
@@ -176,16 +176,7 @@ func main() {
 		}
 		// Resume federation for users that gained a follower in earlier runs — the
 		// started map is in-memory, so a restart otherwise silently stops polling.
-		remote := nodeFollowerStore{req: nodeCli}
 		for _, u := range fed.list() {
-			// Recover followers that did persist into Warpnet (owner-targeted read)
-			// into the local store, so federation resumes without re-following when
-			// /data is fresh. A no-op when Warpnet has none.
-			if urls, lerr := remote.List(u); lerr == nil {
-				for _, actorURL := range urls {
-					_ = ff.Add(u, actorURL)
-				}
-			}
 			of.start(u)
 		}
 	}
