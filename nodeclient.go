@@ -272,6 +272,7 @@ func (c *nodeClient) ownerNode(userID string) (peer.ID, bool) {
 	c.mu.Lock()
 	c.owner[userID] = p
 	c.mu.Unlock()
+	log.Infof("nodeclient: owner of %s resolved to node %s; user-scoped routes target it directly", userID, p)
 	return p, true
 }
 

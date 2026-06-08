@@ -35,6 +35,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // followerStore records, per local (bridged) user, the remote Fediverse actors
@@ -120,4 +122,32 @@ func (s *fileFollowerStore) List(localUser string) ([]string, error) {
 	out := make([]string, len(src))
 	copy(out, src)
 	return out, nil
+}
+
+// dualFollowerStore makes the gateway durably own its Fediverse follower list.
+// The local store is authoritative for delivery — it persists in /data and is
+// independent of Warpnet's follow-graph routing — while the remote store mirrors
+// each follow into Warpnet best-effort, so the owner node reflects the follower
+// (count, notifications). Delivery reads from the local store, so a post always
+// reaches every Fediverse follower regardless of which member node the network
+// routes a follow query to, and the set survives gateway redeploys.
+type dualFollowerStore struct {
+	local  followerStore
+	remote followerStore
+}
+
+func (d dualFollowerStore) Add(localUser, actorURL string) error {
+	if err := d.local.Add(localUser, actorURL); err != nil {
+		return err
+	}
+	if d.remote != nil {
+		if err := d.remote.Add(localUser, actorURL); err != nil {
+			log.Warnf("followers: mirror %s -> Warpnet failed (delivery unaffected): %v", actorURL, err)
+		}
+	}
+	return nil
+}
+
+func (d dualFollowerStore) List(localUser string) ([]string, error) {
+	return d.local.List(localUser)
 }
