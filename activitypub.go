@@ -73,12 +73,38 @@ type actor struct {
 	Summary           string          `json:"summary,omitempty"`
 	Icon              *attachment     `json:"icon,omitempty"`
 	Image             *attachment     `json:"image,omitempty"`
+	Tag               []emojiTag      `json:"tag,omitempty"`
+	Attachment        []propertyValue `json:"attachment,omitempty"`
 	Inbox             string          `json:"inbox"`
 	Outbox            string          `json:"outbox"`
 	Followers         string          `json:"followers"`
 	Following         string          `json:"following"`
 	PublicKey         publicKey       `json:"publicKey"`
 	Endpoints         *actorEndpoints `json:"endpoints,omitempty"`
+}
+
+// emojiTag is a Mastodon custom emoji (toot:Emoji) referenced by shortcode in
+// the actor's name; Mastodon renders it inline wherever the name appears
+// (profile and every post in the timeline).
+type emojiTag struct {
+	Type string     `json:"type"`
+	ID   string     `json:"id"`
+	Name string     `json:"name"` // shortcode incl. colons, e.g. ":warpnet:"
+	Icon *emojiIcon `json:"icon"`
+}
+
+type emojiIcon struct {
+	Type      string `json:"type"`
+	MediaType string `json:"mediaType"`
+	URL       string `json:"url"`
+}
+
+// propertyValue is a Mastodon profile metadata field (schema:PropertyValue),
+// rendered as a labeled row on the profile.
+type propertyValue struct {
+	Type  string `json:"type"`
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 // activity is the envelope we emit for outbound activities (e.g. Accept).
