@@ -113,6 +113,7 @@ func (g *gateway) routes() http.Handler {
 	mux.HandleFunc(pathUsers, g.handleUsers)
 	mux.HandleFunc(pathInbox, g.handleSharedInbox)
 	mux.HandleFunc(pathMedia, g.handleMedia)
+	mux.HandleFunc(pathStatic, g.handleStatic)
 	return logRequests(mux)
 }
 
@@ -202,13 +203,27 @@ func (g *gateway) handleUsers(w http.ResponseWriter, r *http.Request) {
 
 func (g *gateway) serveActor(w http.ResponseWriter, wu warpnetUser) {
 	id := g.actorID(wu.PreferredUsername)
+	name := wu.DisplayName
+	if name == "" {
+		name = wu.PreferredUsername
+	}
 	a := actor{
-		Context:           []string{asContext, secContext},
+		// The extra context object defines toot:Emoji and schema:PropertyValue so
+		// the badge emoji and the "Network" profile field are recognized.
+		Context: []any{asContext, secContext, map[string]string{
+			"toot":          "http://joinmastodon.org/ns#",
+			"Emoji":         "toot:Emoji",
+			"schema":        "http://schema.org#",
+			"PropertyValue": "schema:PropertyValue",
+			"value":         "schema:value",
+		}},
 		ID:                id,
 		Type:              "Person",
 		PreferredUsername: wu.PreferredUsername,
-		Name:              wu.DisplayName,
-		Summary:           wu.Summary,
+		Name:              name + " " + warpnetEmojiShortcode,
+		Summary:           badgedSummary(wu.Summary),
+		Tag:               []emojiTag{g.warpnetActorTag()},
+		Attachment:        []propertyValue{warpnetNetworkField()},
 		Inbox:             id + pathInbox,
 		Outbox:            id + "/outbox",
 		Followers:         id + pathFollowers,
