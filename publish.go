@@ -38,16 +38,43 @@ import (
 // as a signed Create(Note). Delivery is best-effort per follower and bounded by
 // the gateway's delivery semaphore; it blocks until all deliveries settle.
 func (g *gateway) publishNote(ctx context.Context, localUser string, t tweet) {
+	g.deliverToFollowers(ctx, localUser, g.buildCreateNote(localUser, t), "publish tweet "+t.Id)
+}
+
+// sendActorUpdate pushes an Update(Person) to localUser's Fediverse followers so
+// their servers refresh the cached profile (avatar, bio, the Warpnet badge).
+// Mastodon only re-fetches a remote actor on an Update or after its cache goes
+// stale, so a profile change is otherwise invisible to existing followers.
+func (g *gateway) sendActorUpdate(ctx context.Context, localUser string) {
+	wu, ok := g.source.GetUser(localUser)
+	if !ok {
+		return
+	}
+	actorID := g.actorID(localUser)
+	update := activity{
+		Context: []any{asContext, secContext},
+		ID:      actorID + "#update-" + randomToken(),
+		Type:    typeUpdate,
+		Actor:   actorID,
+		Object:  g.buildActor(wu),
+		To:      []string{asPublic},
+		Cc:      []string{actorID + pathFollowers},
+	}
+	g.deliverToFollowers(ctx, localUser, update, "profile-update "+localUser)
+}
+
+// deliverToFollowers fans doc out to every Fediverse follower of localUser as a
+// signed delivery, bounded by the delivery semaphore; label prefixes the logs.
+func (g *gateway) deliverToFollowers(ctx context.Context, localUser string, doc any, label string) {
 	actorURLs, err := g.followers.List(localUser)
 	if err != nil {
-		log.Errorf("publish: list followers of %s: %v", localUser, err)
+		log.Errorf("%s: list followers of %s: %v", label, localUser, err)
 		return
 	}
 	if len(actorURLs) == 0 {
-		log.Infof("publish: tweet %s: %s has no Fediverse followers, skipping", t.Id, localUser)
+		log.Infof("%s: %s has no Fediverse followers, skipping", label, localUser)
 		return
 	}
-	create := g.buildCreateNote(localUser, t)
 
 	var wg sync.WaitGroup
 	for _, actorURL := range actorURLs {
@@ -63,14 +90,14 @@ func (g *gateway) publishNote(ctx context.Context, localUser string, t tweet) {
 			defer func() { <-g.sem }()
 			inbox, ierr := g.remoteInbox(ctx, actor)
 			if ierr != nil {
-				log.Errorf("publish: resolve inbox for %s: %v", actor, ierr)
+				log.Errorf("%s: resolve inbox for %s: %v", label, actor, ierr)
 				return
 			}
-			if perr := g.postSigned(ctx, localUser, inbox, create); perr != nil {
-				log.Errorf("publish: deliver tweet %s to %s: %v", t.Id, inbox, perr)
+			if perr := g.postSigned(ctx, localUser, inbox, doc); perr != nil {
+				log.Errorf("%s: deliver to %s: %v", label, inbox, perr)
 				return
 			}
-			log.Infof("publish: delivered tweet %s to %s", t.Id, inbox)
+			log.Infof("%s: delivered to %s", label, inbox)
 		}(actorURL)
 	}
 	wg.Wait()

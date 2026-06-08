@@ -202,6 +202,12 @@ func (g *gateway) handleUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *gateway) serveActor(w http.ResponseWriter, wu warpnetUser) {
+	writeJSON(w, contentTypeAP, g.buildActor(wu))
+}
+
+// buildActor renders the actor document. Shared by serveActor (served on GET)
+// and the outbound Update(Person) that refreshes followers' cached profile.
+func (g *gateway) buildActor(wu warpnetUser) actor {
 	id := g.actorID(wu.PreferredUsername)
 	name := wu.DisplayName
 	if name == "" {
@@ -241,7 +247,7 @@ func (g *gateway) serveActor(w http.ResponseWriter, wu warpnetUser) {
 	if wu.Background != "" {
 		a.Image = &attachment{Type: "Image", URL: g.baseURL() + pathMedia + encodeMediaRef(wu.PreferredUsername, wu.Background)}
 	}
-	writeJSON(w, contentTypeAP, a)
+	return a
 }
 
 func (g *gateway) serveEmptyCollection(w http.ResponseWriter, id string) {
