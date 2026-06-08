@@ -70,6 +70,10 @@ func (o *outboundFederation) start(localUser string) {
 		func(actorURL string) { o.g.sendFollow(localUser, actorURL) },
 		func(actorURL string) { o.g.sendUndoFollow(localUser, actorURL) },
 	).run(o.ctx)
+	// Refresh followers' cached profile (badge, avatar, bio) once federation
+	// (re)starts — e.g. after a redeploy — since Mastodon won't re-fetch the
+	// actor on its own.
+	go o.g.sendActorUpdate(o.ctx, localUser)
 }
 
 const followPollInterval = 30 * time.Second
