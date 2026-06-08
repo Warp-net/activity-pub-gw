@@ -105,7 +105,7 @@ func (g *gateway) baseURL() string            { return "https://" + g.host }
 func (g *gateway) actorID(user string) string { return g.baseURL() + pathUsers + user }
 func (g *gateway) keyID(user string) string   { return g.actorID(user) + "#main-key" }
 
-func (g *gateway) routes() *http.ServeMux {
+func (g *gateway) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/webfinger", g.handleWebFinger)
 	mux.HandleFunc("/.well-known/nodeinfo", g.handleNodeInfoLinks)
@@ -113,7 +113,27 @@ func (g *gateway) routes() *http.ServeMux {
 	mux.HandleFunc(pathUsers, g.handleUsers)
 	mux.HandleFunc(pathInbox, g.handleSharedInbox)
 	mux.HandleFunc(pathMedia, g.handleMedia)
-	return mux
+	return logRequests(mux)
+}
+
+// logRequests logs every inbound request (method, path, status, user-agent) so
+// it's visible what Mastodon actually fetches — the actor, /media, the outbox, etc.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(sw, r)
+		log.Infof("http: %s %s -> %d (ua=%q)", r.Method, r.URL.RequestURI(), sw.status, r.UserAgent())
+	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }
 
 func (g *gateway) handleWebFinger(w http.ResponseWriter, r *http.Request) {
@@ -160,14 +180,18 @@ func (g *gateway) handleUsers(w http.ResponseWriter, r *http.Request) {
 	case "inbox":
 		g.handleInbox(w, r, user)
 	case "outbox":
-		g.serveEmptyCollection(w, g.actorID(user)+"/outbox")
+		g.serveOutbox(w, user)
 	case "followers":
 		g.serveFollowers(w, user)
 	case "following":
-		g.serveEmptyCollection(w, g.actorID(user)+"/following")
+		g.serveFollowing(w, user)
 	case "statuses":
 		if len(parts) < 3 || parts[2] == "" {
 			http.NotFound(w, r)
+			return
+		}
+		if len(parts) >= 4 && parts[3] == "replies" {
+			g.serveReplies(w, user, parts[2])
 			return
 		}
 		g.serveStatus(w, r, user, parts[2])
@@ -178,7 +202,7 @@ func (g *gateway) handleUsers(w http.ResponseWriter, r *http.Request) {
 
 func (g *gateway) serveActor(w http.ResponseWriter, wu warpnetUser) {
 	id := g.actorID(wu.PreferredUsername)
-	writeJSON(w, contentTypeAP, actor{
+	a := actor{
 		Context:           []string{asContext, secContext},
 		ID:                id,
 		Type:              "Person",
@@ -195,7 +219,14 @@ func (g *gateway) serveActor(w http.ResponseWriter, wu warpnetUser) {
 			PublicKeyPEM: g.keyPubPEM,
 		},
 		Endpoints: &actorEndpoints{SharedInbox: g.baseURL() + pathInbox},
-	})
+	}
+	if wu.Avatar != "" {
+		a.Icon = &attachment{Type: "Image", URL: g.baseURL() + pathMedia + encodeMediaRef(wu.PreferredUsername, wu.Avatar)}
+	}
+	if wu.Background != "" {
+		a.Image = &attachment{Type: "Image", URL: g.baseURL() + pathMedia + encodeMediaRef(wu.PreferredUsername, wu.Background)}
+	}
+	writeJSON(w, contentTypeAP, a)
 }
 
 func (g *gateway) serveEmptyCollection(w http.ResponseWriter, id string) {
@@ -220,6 +251,126 @@ func (g *gateway) serveFollowers(w http.ResponseWriter, user string) {
 	writeJSON(w, contentTypeAP, orderedCollection{
 		Context:      asContext,
 		ID:           g.actorID(user) + pathFollowers,
+		Type:         "OrderedCollection",
+		TotalItems:   len(items),
+		OrderedItems: items,
+	})
+}
+
+// serveOutbox renders the user's Warpnet posts (PUBLIC_GET_TWEETS) as an
+// OrderedCollection of Create(Note) so they appear on the Mastodon profile.
+func (g *gateway) serveOutbox(w http.ResponseWriter, userID string) {
+	id := g.actorID(userID) + "/outbox"
+	if g.req == nil {
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	bt, err := g.req.requestUser(userID, routeGetTweets, getAllTweetsEvent{UserId: userID})
+	if err != nil {
+		log.Warnf("outbox: fetch %s: %v", userID, err)
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	var resp tweetsResponse
+	if jerr := json.Unmarshal(bt, &resp); jerr != nil {
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	items := make([]any, 0, len(resp.Tweets))
+	for _, t := range resp.Tweets {
+		if !publishableTweet(t, userID) { // own original top-level posts, matching outbound federation
+			continue
+		}
+		items = append(items, g.buildCreateNote(userID, t))
+	}
+
+	// totalItems is the user's authoritative post count: GET_TWEETS is paginated,
+	// so the fetched page is only a slice — reporting its length as the total
+	// (e.g. the page size) understates the real count.
+	total := len(items)
+	if ub, uerr := g.req.request(routeGetUser, getUserEvent{UserId: userID}); uerr == nil {
+		var u user
+		if json.Unmarshal(ub, &u) == nil && u.TweetsCount > 0 {
+			total = int(u.TweetsCount)
+		}
+	}
+
+	writeJSON(w, contentTypeAP, orderedCollection{
+		Context:      asContext,
+		ID:           id,
+		Type:         "OrderedCollection",
+		TotalItems:   total,
+		OrderedItems: items,
+	})
+}
+
+// serveFollowing renders who the user follows (PUBLIC_GET_FOLLOWINGS): fediverse
+// follows resolve to their actor URL, Warpnet follows to their gateway actor.
+func (g *gateway) serveFollowing(w http.ResponseWriter, user string) {
+	id := g.actorID(user) + "/following"
+	if g.req == nil {
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	bt, err := g.req.requestUser(user, routeGetFollowings, getFollowersEvent{UserId: user})
+	if err != nil {
+		log.Warnf("following: fetch %s: %v", user, err)
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	var resp followingsResponse
+	if jerr := json.Unmarshal(bt, &resp); jerr != nil {
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	items := make([]any, 0, len(resp.Followings))
+	for _, fid := range resp.Followings {
+		if url, derr := decodeActorID(fid); derr == nil {
+			items = append(items, url)
+		} else {
+			items = append(items, g.actorID(fid))
+		}
+	}
+	writeJSON(w, contentTypeAP, orderedCollection{
+		Context:      asContext,
+		ID:           id,
+		Type:         "OrderedCollection",
+		TotalItems:   len(items),
+		OrderedItems: items,
+	})
+}
+
+// serveReplies renders the replies to a Note (PUBLIC_GET_REPLIES) as an
+// OrderedCollection of Notes for thread context. Only Warpnet-authored replies
+// are inlined; fediverse replies (ap: ids) are omitted — Mastodon has its own.
+func (g *gateway) serveReplies(w http.ResponseWriter, user, tweetID string) {
+	id := g.actorID(user) + pathStatuses + tweetID + "/replies"
+	if g.req == nil {
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	bt, err := g.req.requestUser(user, routeGetReplies, getTweetEvent{TweetId: tweetID, UserId: user})
+	if err != nil {
+		log.Warnf("replies: fetch %s/%s: %v", user, tweetID, err)
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	var resp repliesResponse
+	if jerr := json.Unmarshal(bt, &resp); jerr != nil {
+		g.serveEmptyCollection(w, id)
+		return
+	}
+	items := make([]any, 0, len(resp.Replies))
+	for _, rn := range resp.Replies {
+		t := rn.Reply
+		if t.Id == "" || strings.HasPrefix(t.UserId, apFollowerPrefix) {
+			continue // skip fediverse-authored replies; Mastodon already has them
+		}
+		items = append(items, g.buildNote(t.UserId, t))
+	}
+	writeJSON(w, contentTypeAP, orderedCollection{
+		Context:      asContext,
+		ID:           id,
 		Type:         "OrderedCollection",
 		TotalItems:   len(items),
 		OrderedItems: items,

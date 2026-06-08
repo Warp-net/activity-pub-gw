@@ -63,9 +63,11 @@ func newTweetPoller(req nodeRequester, owner string, publish func(context.Contex
 }
 
 func (p *tweetPoller) run(ctx context.Context) {
-	for _, t := range p.fetch() { // seed: don't replay history
+	seed := p.fetch() // seed: don't replay history
+	for _, t := range seed {
 		p.seen[t.Id] = struct{}{}
 	}
+	log.Infof("poller: started for %s (seeded %d existing tweets)", p.owner, len(seed))
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 	for {
@@ -79,19 +81,24 @@ func (p *tweetPoller) run(ctx context.Context) {
 }
 
 func (p *tweetPoller) poll(ctx context.Context) {
-	for _, t := range p.fetch() {
+	tweets := p.fetch()
+	newCount, pubCount := 0, 0
+	for _, t := range tweets {
 		if _, ok := p.seen[t.Id]; ok {
 			continue
 		}
 		p.seen[t.Id] = struct{}{}
+		newCount++
 		if publishableTweet(t, p.owner) {
+			pubCount++
 			p.publish(ctx, p.owner, t)
 		}
 	}
+	log.Infof("poller: %s: fetched %d, new %d, publishable %d", p.owner, len(tweets), newCount, pubCount)
 }
 
 func (p *tweetPoller) fetch() []tweet {
-	bt, err := p.req.request(routeGetTweets, getAllTweetsEvent{UserId: p.owner})
+	bt, err := p.req.requestUser(p.owner, routeGetTweets, getAllTweetsEvent{UserId: p.owner})
 	if err != nil {
 		log.Errorf("poller: get tweets for %s: %v", p.owner, err)
 		return nil

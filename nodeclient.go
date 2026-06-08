@@ -37,7 +37,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	camouflage "github.com/Warp-net/libp2p-camouflage-transport"
+	"github.com/Warp-net/warpnet/security"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	p2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -45,6 +47,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/pnet"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	noise "github.com/libp2p/go-libp2p/p2p/security/noise"
 	log "github.com/sirupsen/logrus"
 )
@@ -62,8 +65,9 @@ type nodeClient struct {
 	dht    *dht.IpfsDHT
 	relays map[peer.ID]struct{} // entry peers (relays): discovery/connectivity only, not data routes
 
-	mu   sync.Mutex
-	good []peer.ID // member nodes known to answer data routes; tried first
+	mu    sync.Mutex
+	good  []peer.ID          // member nodes known to answer data routes; tried first
+	owner map[string]peer.ID // userID -> its home node (domain.User.NodeId); user-scoped routes target it
 }
 
 // networkEntries are the network's bootstrap relays (the DHT entry points) plus
@@ -109,19 +113,40 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 		return nil, fmt.Errorf("nodeclient: key: %w", err)
 	}
 
+	// PSK keys the private network on the network name + MAJOR version (warpnet's
+	// security.GeneratePSK); major 0 matches the live networks.
+	ver, err := semver.NewVersion("0.0.0")
+	if err != nil {
+		return nil, fmt.Errorf("nodeclient: version: %w", err)
+	}
+	psk, err := security.GeneratePSK(network, ver)
+	if err != nil {
+		return nil, fmt.Errorf("nodeclient: psk: %w", err)
+	}
+
+	// No resource-manager limits: the whole testnet shares one IP, so the default
+	// per-IP connection cap blocks the gateway from reaching the member node and
+	// makes resolution/federation flaky.
+	rm, err := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(rcmgr.InfiniteLimits))
+	if err != nil {
+		return nil, fmt.Errorf("nodeclient: resource manager: %w", err)
+	}
+
 	h, err := libp2p.New(
+		libp2p.ResourceManager(rm),
 		libp2p.Identity(p2pPriv),
-		libp2p.PrivateNetwork(pnet.PSK(generatePSK(network))),
+		libp2p.PrivateNetwork(pnet.PSK(psk)),
 		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
 		libp2p.WithDialTimeout(60*time.Second),
 		libp2p.Transport(camouflage.NewCamouflageTransport),
 		libp2p.Ping(true),
 		libp2p.Security(noise.ID, noise.New),
-		libp2p.EnableAutoNATv2(),
+		// Outbound-only client (inbound is via Tailscale Funnel): advertise NO
+		// AutoNAT/NAT services. EnableNATService made this NAT'd peer answer other
+		// nodes' reachability probes with wrong verdicts, flipping public member
+		// nodes to "private" (crashing business nodes). Only the relay transport
+		// is needed — to dial member nodes that are reachable via a relay.
 		libp2p.EnableRelay(),
-		libp2p.EnableHolePunching(),
-		libp2p.EnableNATService(),
-		libp2p.NATPortMap(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("nodeclient: new host: %w", err)
@@ -164,7 +189,7 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 	}
 	log.Infof("nodeclient: joined Warpnet (%s) via %d relay(s); discovering members via DHT", network, connected)
 
-	return &nodeClient{h: h, priv: priv, dht: kdht, relays: relays}, nil
+	return &nodeClient{h: h, priv: priv, dht: kdht, relays: relays, owner: map[string]peer.ID{}}, nil
 }
 
 // request streams the route to the member nodes discovered via the DHT, trying
@@ -196,6 +221,67 @@ func (c *nodeClient) request(route string, payload any) ([]byte, error) {
 		lastErr = err
 	}
 	return nil, fmt.Errorf("nodeclient: %s failed on all member nodes: %w", route, lastErr)
+}
+
+// requestUser streams a user-scoped route directly to the node that OWNS userID
+// (its domain.User.NodeId). Routes like POST_FOLLOW and GET_FOLLOWERS are
+// authoritative only on the owner node: a random member node silently "accepts"
+// a follow without persisting it and reads back an empty follower list, which
+// made federation depend on which node the DHT happened to answer with. Falls
+// back to the broadcast request when the owner can't be resolved or reached.
+func (c *nodeClient) requestUser(userID, route string, payload any) ([]byte, error) {
+	if owner, ok := c.ownerNode(userID); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		bt, err := c.streamToMember(ctx, owner, route, payload)
+		cancel()
+		if err == nil {
+			c.remember(owner)
+			return bt, nil
+		}
+		log.Warnf("nodeclient: %s on owner of %s failed, falling back to broadcast: %v", route, userID, err)
+		c.forgetOwner(userID)
+	}
+	return c.request(route, payload)
+}
+
+// ownerNode resolves userID's home node from domain.User.NodeId (via GET_USER,
+// which any node can answer because profiles are replicated; the node_id it
+// carries is the user's authoritative node regardless of who replied) and
+// caches it.
+func (c *nodeClient) ownerNode(userID string) (peer.ID, bool) {
+	c.mu.Lock()
+	p, ok := c.owner[userID]
+	c.mu.Unlock()
+	if ok {
+		return p, true
+	}
+
+	bt, err := c.request(routeGetUser, getUserEvent{UserId: userID})
+	if err != nil {
+		return "", false
+	}
+	var u user
+	if json.Unmarshal(bt, &u) != nil || u.NodeId == "" {
+		return "", false
+	}
+	p, err = peer.Decode(u.NodeId)
+	if err != nil {
+		log.Warnf("nodeclient: bad node_id %q for %s: %v", u.NodeId, userID, err)
+		return "", false
+	}
+	c.mu.Lock()
+	c.owner[userID] = p
+	c.mu.Unlock()
+	log.Infof("nodeclient: owner of %s resolved to node %s; user-scoped routes target it directly", userID, p)
+	return p, true
+}
+
+// forgetOwner drops a cached owner mapping so the next user-scoped request
+// re-resolves it (e.g. after the owner node moved or went briefly unreachable).
+func (c *nodeClient) forgetOwner(userID string) {
+	c.mu.Lock()
+	delete(c.owner, userID)
+	c.mu.Unlock()
 }
 
 func (c *nodeClient) close() {
@@ -232,6 +318,8 @@ func (s nodeSource) GetUser(preferredUsername string) (warpnetUser, bool) {
 		PreferredUsername: u.Id,
 		DisplayName:       u.Username,
 		Summary:           u.Bio,
+		Avatar:            u.AvatarKey,
+		Background:        u.BackgroundImageKey,
 	}, true
 }
 

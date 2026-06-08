@@ -27,23 +27,21 @@ resulting from the use or misuse of this software.
 
 package main
 
-// The Warpnet wire essentials — PSK derivation, message signing, bootstrap
-// peers, and the stream request/response framing — reimplemented here (copied
-// from warpnet's security/config/stream) so the gateway speaks the protocol
-// with only native libp2p, no warpnet packages.
+// The Warpnet wire framing — the gateway opens a plain libp2p stream and writes
+// warpnet's signed event.Message envelope (signed with warpnet's security.Sign).
+// PSK derivation and the message/event DTOs come from warpnet's own packages
+// (security, event, domain); only the bootstrap peer list is kept local.
 
 import (
 	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"strconv"
 	"time"
 
+	wjson "github.com/Warp-net/warpnet/json"
+	"github.com/Warp-net/warpnet/security"
 	"github.com/google/uuid"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -53,12 +51,8 @@ import (
 
 const defaultWarpnetNetwork = "warpnet"
 
-// warpnetNetworkMajor must match the MAJOR version of the Warpnet network (the
-// repo `version` file): the PSK is keyed on it, so a mismatch fails to connect.
-const warpnetNetworkMajor = "0"
-
-// bootstrapByNetwork lists the public entry nodes per network (copied from the
-// warpnet config).
+// bootstrapByNetwork lists the public entry nodes per network (the network's
+// relays — the gateway's DHT bootstrap; member nodes are found via the DHT).
 var bootstrapByNetwork = map[string][]string{
 	defaultWarpnetNetwork: {
 		"/ip4/207.154.221.44/tcp/4001/p2p/12D3KooWMKZFrp1BDKg9amtkv5zWnLhuUXN32nhqMvbtMdV2hz7j",
@@ -73,36 +67,6 @@ var bootstrapByNetwork = map[string][]string{
 	},
 }
 
-// spbFounding anchors the PSK entropy (copied verbatim from warpnet security).
-const spbFounding = -((int64(133129) << 16) + 51200)
-
-func generateAnchoredEntropy() []byte {
-	input := []byte(strconv.FormatInt(spbFounding, 10))
-	for range 10 {
-		sum := sha256.Sum256(input)
-		input = sum[:]
-	}
-	return input
-}
-
-// generatePSK derives the 32-byte private-network key for the given network,
-// byte-identical to warpnet's security.GeneratePSK.
-func generatePSK(network string) []byte {
-	if network == "mainnet" {
-		network = defaultWarpnetNetwork
-	}
-	seed := append([]byte(network), []byte(warpnetNetworkMajor)...)
-	seed = append(seed, generateAnchoredEntropy()...)
-	sum := sha256.Sum256(seed)
-	return sum[:]
-}
-
-// signBody signs the request body with the node's ed25519 key (warpnet's
-// security.Sign): base64(ed25519 signature).
-func signBody(priv ed25519.PrivateKey, body []byte) string {
-	return base64.StdEncoding.EncodeToString(ed25519.Sign(priv, body))
-}
-
 // streamSend opens a libp2p stream on the route's protocol ID, writes the signed
 // message envelope, and reads the full response — warpnet's stream framing.
 func streamSend(ctx context.Context, h host.Host, p peer.ID, priv ed25519.PrivateKey, route string, payload any) ([]byte, error) {
@@ -112,7 +76,7 @@ func streamSend(ctx context.Context, h host.Host, p peer.ID, priv ed25519.Privat
 			body = b
 		} else {
 			var err error
-			if body, err = json.Marshal(payload); err != nil {
+			if body, err = wjson.Marshal(payload); err != nil {
 				return nil, fmt.Errorf("stream: marshal payload: %w", err)
 			}
 		}
@@ -127,14 +91,14 @@ func streamSend(ctx context.Context, h host.Host, p peer.ID, priv ed25519.Privat
 	}
 	defer func() { _ = s.Close() }()
 
-	data, err := json.Marshal(message{
-		Body:        json.RawMessage(body),
+	data, err := wjson.Marshal(message{
+		Body:        wjson.RawMessage(body),
 		MessageId:   uuid.New().String(),
 		NodeId:      h.ID().String(),
 		Destination: route,
 		Timestamp:   time.Now(),
 		Version:     "0.0.0",
-		Signature:   signBody(priv, body),
+		Signature:   security.Sign(priv, body),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("stream: marshal envelope: %w", err)

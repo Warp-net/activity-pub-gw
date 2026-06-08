@@ -93,5 +93,6 @@ func (g *gateway) handleMedia(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set(headerContentType, mime)
+	log.Infof("media: served %s/%s (%d bytes, %s)", userID, key, len(bytes), mime)
 	_, _ = w.Write(bytes)
 }

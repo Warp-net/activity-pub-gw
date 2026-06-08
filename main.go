@@ -63,7 +63,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.3"
+const gatewayVersion = "0.1.14"
 
 const fatalFmt = "gateway: %v"
 
@@ -136,8 +136,9 @@ func main() {
 		log.Infoln("gateway: joined Warpnet; any user is resolvable via the network")
 	}
 
-	// Follower graph lives in Warpnet (via the node connector); only when no
-	// node is configured does the gateway fall back to a local dev store.
+	// The follower graph lives in Warpnet, read/written through the owner member
+	// node via the node connector (owner-targeted routes). Only when no node is
+	// configured does the gateway fall back to a local dev store.
 	var followers followerStore
 	var req nodeRequester
 	if nodeCli != nil {
@@ -167,7 +168,17 @@ func main() {
 	// Fediverse follower (an accepted inbound Follow), start federating that
 	// user's new posts and follows. It is never pinned to a specific user.
 	if nodeCli != nil {
-		g.onFollowed = newOutboundFederation(appCtx, nodeCli, g).start
+		of := newOutboundFederation(appCtx, nodeCli, g)
+		fed := newFederatedStore(envOr("GATEWAY_FEDERATED", "fediverse-gateway-federated.json"))
+		g.onFollowed = func(localUser string) {
+			fed.add(localUser)
+			of.start(localUser)
+		}
+		// Resume federation for users that gained a follower in earlier runs — the
+		// started map is in-memory, so a restart otherwise silently stops polling.
+		for _, u := range fed.list() {
+			of.start(u)
+		}
 	}
 
 	srv := &http.Server{
