@@ -62,7 +62,7 @@ const (
 // defaultOwnerHandle is the Mastodon account the gateway advertises as its node
 // owner (override with GATEWAY_OWNER_HANDLE) so Warpnet discovery seeds it as
 // the entry point into the Fediverse. The gateway has no Warpnet user of its own.
-const defaultOwnerHandle = "Mastodon@mastodon.social"
+const defaultOwnerHandle = "warpnet@mastodon.social"
 
 // bootstrapByNetwork lists the public entry nodes per network (the network's
 // relays — the gateway's DHT bootstrap; member nodes are found via the DHT).
