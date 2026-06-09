@@ -27,18 +27,16 @@ resulting from the use or misuse of this software.
 
 package main
 
-// nodeserver makes the gateway answer Warpnet's public /public/... routes over
-// libp2p (the Mastodon -> Warpnet direction). To a Warpnet node the gateway is
-// an ordinary member peer: it reports node info with a hardcoded owner (a
-// Mastodon account), so discovery seeds that account, and resolves every
-// user/tweet/image request live from the Fediverse via ActivityPub. The gateway
-// keeps no Warpnet user of its own. It does NOT register the spoof challenge
-// route — it isn't a Warpnet-codebase node — which the node tolerates
-// (discovery's challenge is non-fatal).
+// nodeserver is the libp2p transport for the Mastodon -> Warpnet direction: it
+// answers Warpnet's public /public routes. To a Warpnet node the gateway is an
+// ordinary member peer — it reports node info with a hardcoded Mastodon owner
+// and resolves every request through the mastodonBridge. It verifies the
+// caller's signature (like the node's auth middleware) but holds no domain
+// logic itself, and does NOT register the spoof-challenge route (it is not a
+// Warpnet-codebase node; discovery tolerates that).
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"time"
 
@@ -52,49 +50,90 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// maxRequestBytes bounds an inbound request envelope (the response we write
-// back, e.g. an image, is not capped here).
-const maxRequestBytes = 1 << 20
-
-// apRequestTimeout bounds the ActivityPub work done to answer one node request.
-const apRequestTimeout = 30 * time.Second
+const (
+	// maxRequestBytes bounds an inbound request envelope (the written response,
+	// e.g. an image, is not capped here).
+	maxRequestBytes = 1 << 20
+	// apRequestTimeout bounds the ActivityPub work to answer one node request.
+	apRequestTimeout = 30 * time.Second
+)
 
 // routeHandler answers one public route from the signed request body.
 type routeHandler func(ctx context.Context, body []byte) (any, error)
 
 // serveRoutes registers the gateway as a libp2p server for Warpnet's public
-// routes. ownerHandle is the Mastodon account (name@instance) the gateway
-// advertises as its node owner so discovery seeds it.
+// routes, delegating all domain work to the bridge. ownerHandle is the Mastodon
+// account advertised as the node owner.
 func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
-	g.nodeID = c.h.ID().String()
+	b := newMastodonBridge(g, c.h.ID().String())
 
 	handlers := map[string]routeHandler{
-		event.PUBLIC_GET_INFO:        c.infoHandler(ownerHandle),
-		routeGetUser:                 wrapJSON(g.handleGetUser),
-		event.PUBLIC_GET_USERS:       wrapJSON(g.handleGetUsers),
-		routeGetTweets:               wrapJSON(g.handleGetTweets),
-		routeGetTweet:                wrapJSON(g.handleGetTweet),
-		routeGetReplies:              wrapJSON(g.handleGetReplies),
-		routeGetFollowers:            wrapJSON(g.handleGetFollowers),
-		routeGetFollowings:           wrapJSON(g.handleGetFollowings),
-		routeGetImage:                wrapJSON(g.handleGetImage),
-		event.PUBLIC_GET_TWEET_STATS: wrapJSON(g.handleGetTweetStats),
-		event.PUBLIC_POST_VIEW:       func(context.Context, []byte) (any, error) { return event.ViewsCountResponse{Count: 1}, nil },
-		// Write routes federate the Warpnet action onto Mastodon as a signed
-		// ActivityPub activity (Mastodon -> star/boost/reply/follow).
-		routePostLike:      wrapJSON(g.handleLike),
-		routePostUnlike:    wrapJSON(g.handleUnlike),
-		routePostFollow:    wrapJSON(g.handleFollow),
-		routePostUnfollow:  wrapJSON(g.handleUnfollow),
-		routePostReply:     wrapJSON(g.handleReply),
-		routePostRetweet:   wrapJSON(g.handleRetweet),
-		routePostUnretweet: wrapJSON(g.handleUnretweet),
+		event.PUBLIC_GET_INFO: c.infoHandler(ownerHandle),
+
+		routeGetUser: wrapJSON(func(ctx context.Context, ev getUserEvent) (any, error) {
+			return b.GetUser(ctx, string(ev.UserId))
+		}),
+		event.PUBLIC_GET_USERS: wrapJSON(func(ctx context.Context, ev getAllTweetsEvent) (any, error) {
+			u, err := b.GetUser(ctx, string(ev.UserId))
+			if err != nil {
+				return event.UsersResponse{}, nil //nolint:nilerr // unknown handle -> empty
+			}
+			return event.UsersResponse{Users: []user{u}}, nil
+		}),
+		routeGetTweets: wrapJSON(func(ctx context.Context, ev getAllTweetsEvent) (any, error) {
+			return b.GetTweets(ctx, string(ev.UserId), ev.Cursor)
+		}),
+		routeGetTweet: wrapJSON(func(ctx context.Context, ev getTweetEvent) (any, error) {
+			return b.GetTweet(ctx, string(ev.TweetId))
+		}),
+		routeGetReplies: wrapJSON(func(ctx context.Context, ev getTweetEvent) (any, error) {
+			return b.GetReplies(ctx, string(ev.TweetId))
+		}),
+		event.PUBLIC_GET_TWEET_STATS: wrapJSON(func(ctx context.Context, ev getTweetEvent) (any, error) {
+			return b.GetTweetStats(ctx, string(ev.TweetId))
+		}),
+		routeGetFollowers: wrapJSON(func(ctx context.Context, ev getFollowersEvent) (any, error) {
+			return b.GetFollowers(ctx, string(ev.UserId), ev.Cursor)
+		}),
+		routeGetFollowings: wrapJSON(func(ctx context.Context, ev getFollowersEvent) (any, error) {
+			return b.GetFollowings(ctx, string(ev.UserId), ev.Cursor)
+		}),
+		routeGetImage: wrapJSON(func(ctx context.Context, ev getImageEvent) (any, error) {
+			return b.GetImage(ctx, ev.Key)
+		}),
+		event.PUBLIC_POST_VIEW: func(context.Context, []byte) (any, error) {
+			return event.ViewsCountResponse{Count: 1}, nil
+		},
+
+		routePostLike: wrapJSON(func(ctx context.Context, ev likeEvent) (any, error) {
+			count, err := b.Like(ctx, string(ev.UserId), string(ev.TweetId), false)
+			return event.LikesCountResponse{Count: count}, err
+		}),
+		routePostUnlike: wrapJSON(func(ctx context.Context, ev likeEvent) (any, error) {
+			count, err := b.Like(ctx, string(ev.UserId), string(ev.TweetId), true)
+			return event.LikesCountResponse{Count: count}, err
+		}),
+		routePostFollow: wrapJSON(func(ctx context.Context, ev newFollowEvent) (any, error) {
+			return struct{}{}, b.Follow(ctx, string(ev.FollowerId), string(ev.FollowingId), false)
+		}),
+		routePostUnfollow: wrapJSON(func(ctx context.Context, ev newFollowEvent) (any, error) {
+			return struct{}{}, b.Follow(ctx, string(ev.FollowerId), string(ev.FollowingId), true)
+		}),
+		routePostReply: wrapJSON(func(ctx context.Context, ev newReplyEvent) (any, error) {
+			return replyEcho(ev), b.Reply(ctx, ev)
+		}),
+		routePostRetweet: wrapJSON(func(ctx context.Context, ev tweet) (any, error) {
+			return ev, b.Announce(ctx, retweeterOf(ev), retweetObject(ev), false)
+		}),
+		routePostUnretweet: wrapJSON(func(ctx context.Context, ev unretweetEvent) (any, error) {
+			return struct{}{}, b.Announce(ctx, string(ev.RetweeterId), string(ev.TweetId), true)
+		}),
 	}
 
 	for route, h := range handlers {
 		c.h.SetStreamHandler(protocol.ID(route), c.streamHandler(route, h))
 	}
-	log.Infof("nodeserver: serving %d public routes as %s (owner %s)", len(handlers), g.nodeID, ownerHandle)
+	log.Infof("nodeserver: serving %d public routes as %s (owner %s)", len(handlers), c.h.ID(), ownerHandle)
 }
 
 // streamHandler reads the signed request envelope, verifies it against the
@@ -163,130 +202,6 @@ func (c *nodeClient) infoHandler(ownerHandle string) routeHandler {
 	}
 }
 
-func (g *gateway) handleGetUser(ctx context.Context, ev getUserEvent) (any, error) {
-	return g.apGetUser(ctx, ev.UserId)
-}
-
-// handleGetUsers returns just the requested user; the gateway does not enumerate
-// the Fediverse.
-func (g *gateway) handleGetUsers(ctx context.Context, ev getAllTweetsEvent) (any, error) {
-	u, err := g.apGetUser(ctx, ev.UserId)
-	if err != nil {
-		return event.UsersResponse{}, nil //nolint:nilerr // unknown handle -> empty, not an error
-	}
-	return event.UsersResponse{Users: []user{u}}, nil
-}
-
-func (g *gateway) handleGetTweets(ctx context.Context, ev getAllTweetsEvent) (any, error) {
-	return g.apGetTweets(ctx, ev.UserId, ev.Cursor)
-}
-
-func (g *gateway) handleGetTweet(ctx context.Context, ev getTweetEvent) (any, error) {
-	return g.apGetTweet(ctx, ev.TweetId)
-}
-
-func (g *gateway) handleGetReplies(ctx context.Context, ev getTweetEvent) (any, error) {
-	return g.apGetReplies(ctx, ev.TweetId)
-}
-
-// handleGetTweetStats reads the like/boost/reply counts Mastodon publishes on
-// the Note's likes/shares/replies collections.
-func (g *gateway) handleGetTweetStats(ctx context.Context, ev getTweetEvent) (any, error) {
-	return g.apGetTweetStats(ctx, ev.TweetId)
-}
-
-func (g *gateway) handleGetFollowers(ctx context.Context, ev getFollowersEvent) (any, error) {
-	return g.apGetFollowers(ctx, ev.UserId, ev.Cursor)
-}
-
-func (g *gateway) handleGetFollowings(ctx context.Context, ev getFollowersEvent) (any, error) {
-	return g.apGetFollowings(ctx, ev.UserId, ev.Cursor)
-}
-
-func (g *gateway) handleGetImage(ctx context.Context, ev getImageEvent) (any, error) {
-	return g.apGetImage(ctx, ev.Key)
-}
-
-// handleLike federates a Warpnet like onto Mastodon as a Like activity
-// (Mastodon shows it as a favourite/star) and reports the status's like count.
-func (g *gateway) handleLike(ctx context.Context, ev likeEvent) (any, error) {
-	if err := g.deliverLike(ctx, string(ev.UserId), string(ev.TweetId), false); err != nil {
-		return nil, err
-	}
-	stats, _ := g.apGetTweetStats(ctx, string(ev.TweetId))
-	return event.LikesCountResponse{Count: stats.LikeCount}, nil
-}
-
-func (g *gateway) handleUnlike(ctx context.Context, ev likeEvent) (any, error) {
-	if err := g.deliverLike(ctx, string(ev.UserId), string(ev.TweetId), true); err != nil {
-		return nil, err
-	}
-	stats, _ := g.apGetTweetStats(ctx, string(ev.TweetId))
-	return event.LikesCountResponse{Count: stats.LikeCount}, nil
-}
-
-func (g *gateway) handleFollow(ctx context.Context, ev newFollowEvent) (any, error) {
-	actorURL, err := g.apResolveHandle(ctx, string(ev.FollowingId))
-	if err != nil {
-		return nil, err
-	}
-	g.deliverFollow(string(ev.FollowerId), actorURL, false)
-	return struct{}{}, nil
-}
-
-func (g *gateway) handleUnfollow(ctx context.Context, ev newFollowEvent) (any, error) {
-	actorURL, err := g.apResolveHandle(ctx, string(ev.FollowingId))
-	if err != nil {
-		return nil, err
-	}
-	g.deliverFollow(string(ev.FollowerId), actorURL, true)
-	return struct{}{}, nil
-}
-
-// handleReply federates a Warpnet reply as a Create(Note) inReplyTo the Mastodon
-// status, and echoes the reply back so the Warpnet UI renders it.
-func (g *gateway) handleReply(ctx context.Context, ev newReplyEvent) (any, error) {
-	if err := g.deliverReply(ctx, ev); err != nil {
-		return nil, err
-	}
-	parent := string(ev.RootId)
-	if ev.ParentId != nil {
-		parent = string(*ev.ParentId)
-	}
-	return tweet{
-		Id:        string(ev.Id),
-		ParentId:  &parent,
-		RootId:    string(ev.RootId),
-		Text:      ev.Text,
-		UserId:    string(ev.UserId),
-		Username:  ev.Username,
-		CreatedAt: ev.CreatedAt,
-		Network:   mastodonNetwork,
-	}, nil
-}
-
-func (g *gateway) handleRetweet(ctx context.Context, ev tweet) (any, error) {
-	retweeter := ev.UserId
-	if ev.RetweetedBy != nil && *ev.RetweetedBy != "" {
-		retweeter = *ev.RetweetedBy
-	}
-	object := ev.Id
-	if object == "" {
-		object = ev.RootId
-	}
-	if err := g.deliverAnnounce(ctx, retweeter, object, false); err != nil {
-		return nil, err
-	}
-	return ev, nil
-}
-
-func (g *gateway) handleUnretweet(ctx context.Context, ev unretweetEvent) (any, error) {
-	if err := g.deliverAnnounce(ctx, string(ev.RetweeterId), string(ev.TweetId), true); err != nil {
-		return nil, err
-	}
-	return struct{}{}, nil
-}
-
 // wrapJSON adapts a typed handler to a routeHandler by decoding the request body
 // into T first.
 func wrapJSON[T any](h func(context.Context, T) (any, error)) routeHandler {
@@ -301,34 +216,34 @@ func wrapJSON[T any](h func(context.Context, T) (any, error)) routeHandler {
 	}
 }
 
-// decodeJSONObject parses bytes into a JSON object, used by apsource for AP docs.
-func decodeJSONObject(bt []byte) (map[string]any, error) {
-	var m map[string]any
-	if err := json.Unmarshal(bt, &m); err != nil {
-		return nil, err
+// replyEcho echoes a reply back as a tweet so the Warpnet UI renders it.
+func replyEcho(ev newReplyEvent) tweet {
+	parent := string(ev.RootId)
+	if ev.ParentId != nil {
+		parent = string(*ev.ParentId)
 	}
-	return m, nil
-}
-
-// asString reads a string from a loosely-typed AP value, tolerating the
-// {"id": "..."} object form.
-func asString(v any) string {
-	switch x := v.(type) {
-	case string:
-		return x
-	case map[string]any:
-		id, _ := x["id"].(string)
-		return id
+	return tweet{
+		Id:        string(ev.Id),
+		ParentId:  &parent,
+		RootId:    string(ev.RootId),
+		Text:      ev.Text,
+		UserId:    string(ev.UserId),
+		Username:  ev.Username,
+		CreatedAt: ev.CreatedAt,
+		Network:   mastodonNetwork,
 	}
-	return ""
 }
 
-func asMap(v any) map[string]any {
-	m, _ := v.(map[string]any)
-	return m
+func retweeterOf(ev tweet) string {
+	if ev.RetweetedBy != nil && *ev.RetweetedBy != "" {
+		return *ev.RetweetedBy
+	}
+	return ev.UserId
 }
 
-func asSlice(v any) []any {
-	s, _ := v.([]any)
-	return s
+func retweetObject(ev tweet) string {
+	if ev.Id != "" {
+		return ev.Id
+	}
+	return ev.RootId
 }

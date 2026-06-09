@@ -90,7 +90,6 @@ type gateway struct {
 	keyPubPEM   string
 	source      warpnetSource
 	signingUser string // optional: user to sign authorized-fetch GETs as ("" = unsigned)
-	nodeID      string // the gateway's libp2p peer id; set as User.NodeId on bridged Mastodon users
 	client      *http.Client
 	sem         chan struct{} // bounds concurrent Accept deliveries
 	followers   followerStore
@@ -575,6 +574,66 @@ func (g *gateway) remoteInbox(ctx context.Context, actorURL string) (string, err
 		return inbox, nil
 	}
 	return "", fmt.Errorf("actor %s has no inbox: %w", actorURL, errActorMalformed)
+}
+
+// apGetJSON fetches and decodes an arbitrary AP/JRD JSON document, reusing the
+// SSRF guard. Actor documents go through fetchActor (it signs for
+// authorized-fetch instances); this is for WebFinger and AP collections.
+func (g *gateway) apGetJSON(ctx context.Context, rawURL, accept string) (map[string]any, error) {
+	if !g.allowPrivateTargets {
+		if err := validateRemoteURL(rawURL); err != nil {
+			return nil, err
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil) //nolint:gosec // SSRF-guarded + safe client
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", accept)
+	resp, err := g.client.Do(req) //nolint:gosec // see note above
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch %s: status %d: %w", rawURL, resp.StatusCode, errRemoteStatus)
+	}
+	bt, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(bt, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// fetchMedia downloads a remote media URL (SSRF-guarded), returning its
+// content type and bytes.
+func (g *gateway) fetchMedia(ctx context.Context, rawURL string) (string, []byte, error) {
+	if !g.allowPrivateTargets {
+		if err := validateRemoteURL(rawURL); err != nil {
+			return "", nil, err
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil) //nolint:gosec // SSRF-guarded + safe client
+	if err != nil {
+		return "", nil, err
+	}
+	resp, err := g.client.Do(req) //nolint:gosec // see note above
+	if err != nil {
+		return "", nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("media %s: status %d: %w", rawURL, resp.StatusCode, errRemoteStatus)
+	}
+	bt, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	if err != nil {
+		return "", nil, err
+	}
+	return resp.Header.Get(headerContentType), bt, nil
 }
 
 // postSigned delivers a signed POST of doc to target, as localUser.
