@@ -90,6 +90,7 @@ type gateway struct {
 	keyPubPEM   string
 	source      warpnetSource
 	signingUser string // optional: user to sign authorized-fetch GETs as ("" = unsigned)
+	nodeID      string // the gateway's libp2p peer id; set as User.NodeId on bridged Mastodon users
 	client      *http.Client
 	sem         chan struct{} // bounds concurrent Accept deliveries
 	followers   followerStore

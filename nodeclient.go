@@ -30,7 +30,6 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,6 +48,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	noise "github.com/libp2p/go-libp2p/p2p/security/noise"
+	"github.com/multiformats/go-multiaddr"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -104,7 +104,11 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 		return nil, err
 	}
 
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	// Deterministic identity: a fixed seed yields a stable peer id across
+	// restarts so the node_id carried on bridged Mastodon users keeps resolving
+	// back to this gateway (a rotating id would orphan them). Same derivation as
+	// a Warpnet member node (security.GenerateKeyFromSeed).
+	priv, err := security.GenerateKeyFromSeed([]byte(envOr("GATEWAY_SEED", defaultGatewaySeed)))
 	if err != nil {
 		return nil, fmt.Errorf("nodeclient: identity: %w", err)
 	}
@@ -132,29 +136,44 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 		return nil, fmt.Errorf("nodeclient: resource manager: %w", err)
 	}
 
-	h, err := libp2p.New(
+	opts := []libp2p.Option{
 		libp2p.ResourceManager(rm),
 		libp2p.Identity(p2pPriv),
 		libp2p.PrivateNetwork(pnet.PSK(psk)),
-		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
-		libp2p.WithDialTimeout(60*time.Second),
+		libp2p.ListenAddrStrings(envOr("GATEWAY_P2P_LISTEN", defaultP2PListen)),
+		libp2p.WithDialTimeout(60 * time.Second),
 		libp2p.Transport(camouflage.NewCamouflageTransport),
 		libp2p.Ping(true),
 		libp2p.Security(noise.ID, noise.New),
-		// Outbound-only client (inbound is via Tailscale Funnel): advertise NO
-		// AutoNAT/NAT services. EnableNATService made this NAT'd peer answer other
-		// nodes' reachability probes with wrong verdicts, flipping public member
-		// nodes to "private" (crashing business nodes). Only the relay transport
-		// is needed — to dial member nodes that are reachable via a relay.
 		libp2p.EnableRelay(),
-	)
+		// The gateway now also serves inbound /public routes (Mastodon -> Warpnet),
+		// so it must be a dialable, discoverable peer. It is deployed on a public
+		// libp2p address; advertise public reachability so member nodes treat it
+		// as such instead of probing it as a NAT'd peer.
+		libp2p.ForceReachabilityPublic(),
+	}
+	// Announce an explicit public multiaddr when provided (the listen address is
+	// often 0.0.0.0 / behind a published port).
+	if ann := envOr("GATEWAY_P2P_ANNOUNCE", ""); ann != "" {
+		maddr, merr := multiaddr.NewMultiaddr(ann)
+		if merr != nil {
+			return nil, fmt.Errorf("nodeclient: bad GATEWAY_P2P_ANNOUNCE: %w", merr)
+		}
+		opts = append(opts, libp2p.AddrsFactory(func([]multiaddr.Multiaddr) []multiaddr.Multiaddr {
+			return []multiaddr.Multiaddr{maddr}
+		}))
+	}
+
+	h, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("nodeclient: new host: %w", err)
 	}
 
-	// Join Warpnet's Kademlia DHT (prefix "/<network>", bootstrapped via the relays).
+	// Join Warpnet's Kademlia DHT (prefix "/<network>", bootstrapped via the
+	// relays) as a server so member nodes add the gateway to their routing tables
+	// and discover it as a regular peer.
 	kdht, err := dht.New(ctx, h,
-		dht.Mode(dht.ModeClient),
+		dht.Mode(dht.ModeServer),
 		dht.ProtocolPrefix(protocol.ID("/"+network)),
 		dht.BootstrapPeers(entries...),
 	)

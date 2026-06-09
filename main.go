@@ -63,7 +63,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.18"
+const gatewayVersion = "0.1.19"
 
 const fatalFmt = "gateway: %v"
 
@@ -163,6 +163,14 @@ func main() {
 		sem:       make(chan struct{}, maxInflightDeliveries),
 		followers: followers,
 		req:       req,
+	}
+
+	// Serve Warpnet's public /public routes over libp2p (Mastodon -> Warpnet):
+	// the gateway joins as an ordinary member peer that advertises a Mastodon
+	// account as its node owner (so discovery seeds it) and resolves every
+	// user/tweet/image request live from the Fediverse via ActivityPub.
+	if nodeCli != nil {
+		nodeCli.serveRoutes(g, envOr("GATEWAY_OWNER_HANDLE", defaultOwnerHandle))
 	}
 
 	// Outbound federation follows the graph: when a Warpnet user gains a
