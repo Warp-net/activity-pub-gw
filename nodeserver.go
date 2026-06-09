@@ -153,7 +153,13 @@ func (c *nodeClient) streamHandler(route string, h routeHandler) network.StreamH
 			log.Warnf("nodeserver: %s: bad envelope: %v", route, uerr)
 			return
 		}
-		if conn := s.Conn(); conn != nil && msg.Signature != "" {
+		// Signature is mandatory, like the node's auth middleware: an unsigned
+		// envelope must not bypass verification.
+		if msg.Signature == "" {
+			log.Warnf("nodeserver: %s: signature missing", route)
+			return
+		}
+		if conn := s.Conn(); conn != nil {
 			pub := warpnet.FromIDToPubKey(conn.RemotePeer())
 			if verr := security.VerifySignature(pub, msg.Body, msg.Signature); verr != nil {
 				log.Warnf("nodeserver: %s: signature from %s invalid: %v", route, conn.RemotePeer(), verr)
@@ -179,7 +185,9 @@ func (c *nodeClient) streamHandler(route string, h routeHandler) network.StreamH
 	}
 }
 
-// infoHandler reports the gateway as a public member node owned by ownerHandle.
+// infoHandler reports the gateway as a member node owned by ownerHandle. It is
+// reachable only via relays (ForceReachabilityPrivate), so it reports private
+// reachability, like a NAT'd member node.
 func (c *nodeClient) infoHandler(ownerHandle string) routeHandler {
 	ver, _ := semver.NewVersion("0.0.0")
 	networkName := envOr("NODE_NETWORK", defaultWarpnetNetwork)
@@ -196,7 +204,7 @@ func (c *nodeClient) infoHandler(ownerHandle string) routeHandler {
 			Addresses:    addrs,
 			StartTime:    time.Now(),
 			RelayState:   warpnet.RelayStatusOff,
-			Reachability: warpnet.ReachabilityPublic,
+			Reachability: warpnet.ReachabilityPrivate,
 			Network:      networkName,
 		}, nil
 	}

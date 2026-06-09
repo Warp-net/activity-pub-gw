@@ -63,7 +63,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.25"
+const gatewayVersion = "0.1.26"
 
 const fatalFmt = "gateway: %v"
 

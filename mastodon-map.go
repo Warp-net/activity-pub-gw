@@ -81,20 +81,25 @@ func noteToTweet(authorHandle string, note map[string]any) (tweet, bool) {
 	if id == "" {
 		return tweet{}, false
 	}
-	parent := asString(note["inReplyTo"])
 	username := authorHandle
 	if username == "" {
 		username = handleFromActorURL(asString(note["attributedTo"]))
 	}
 	t := tweet{
-		Id:        id,
-		RootId:    parent,
-		ParentId:  &parent,
+		Id: id,
+		// Warpnet convention: top-level tweets carry RootId = own id and no
+		// ParentId; replies point both at the parent (AP gives only the
+		// immediate inReplyTo, not the thread root).
+		RootId:    id,
 		Text:      stripper.StripTags(asString(note["content"])),
 		UserId:    username,
 		Username:  username,
 		CreatedAt: parseAPTime(asString(note["published"])),
 		Network:   mastodonNetwork,
+	}
+	if parent := asString(note["inReplyTo"]); parent != "" {
+		t.RootId = parent
+		t.ParentId = &parent
 	}
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now()

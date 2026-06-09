@@ -212,7 +212,11 @@ func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (replie
 	if page == nil {
 		return resp, nil
 	}
-	for _, it := range asSlice(page["items"]) {
+	items := asSlice(page["items"])
+	if len(items) == 0 {
+		items = asSlice(page["orderedItems"]) // Mastodon uses items; others orderedItems
+	}
+	for _, it := range items {
 		note := asMap(it)
 		if note == nil {
 			continue
@@ -320,7 +324,16 @@ func (b *mastodonBridge) Like(ctx context.Context, localUser, objectURL string, 
 	if derr := b.ap.postSigned(ctx, localUser, inbox, undoIf(actorID, like, undo)); derr != nil {
 		return 0, derr
 	}
-	return apCollectionCount(note["likes"]), nil
+	// The note was fetched before the Like federated, so its likes count does
+	// not include this action yet — adjust so the caller sees the new value.
+	count := apCollectionCount(note["likes"])
+	if undo {
+		if count > 0 {
+			count--
+		}
+		return count, nil
+	}
+	return count + 1, nil
 }
 
 // Announce federates a boost (or its undo) of objectURL.
@@ -359,9 +372,16 @@ func (b *mastodonBridge) Reply(ctx context.Context, ev newReplyEvent) error {
 	author := asString(obj["attributedTo"])
 	localUser := string(ev.UserId)
 	actorID := b.ap.actorID(localUser)
+	// Reuse the node-assigned reply id in the deterministic /statuses/{id}
+	// scheme: retries then dedupe on the remote side, and the id stays
+	// dereferenceable via serveStatus instead of dangling.
+	noteID := string(ev.Id)
+	if noteID == "" {
+		noteID = randomToken()
+	}
 	n := note{
 		Context:      asContext,
-		ID:           actorID + "/statuses/" + randomToken(),
+		ID:           actorID + pathStatuses + noteID,
 		Type:         typeNote,
 		AttributedTo: actorID,
 		Content:      ev.Text,
