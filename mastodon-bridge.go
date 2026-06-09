@@ -350,10 +350,13 @@ func (b *mastodonBridge) Reply(ctx context.Context, ev newReplyEvent) error {
 	if ev.ParentId != nil && *ev.ParentId != "" {
 		parentURL = string(*ev.ParentId)
 	}
-	_, inbox, err := b.authorInbox(ctx, parentURL)
+	obj, inbox, err := b.authorInbox(ctx, parentURL)
 	if err != nil {
 		return err
 	}
+	// Address the parent author (To) with the public collection in Cc, so the
+	// reply is delivered/notified to them and shown publicly, not just threaded.
+	author := asString(obj["attributedTo"])
 	localUser := string(ev.UserId)
 	actorID := b.ap.actorID(localUser)
 	n := note{
@@ -364,9 +367,10 @@ func (b *mastodonBridge) Reply(ctx context.Context, ev newReplyEvent) error {
 		Content:      ev.Text,
 		Published:    time.Now().UTC().Format(time.RFC3339),
 		InReplyTo:    parentURL,
-		To:           []string{asPublic},
+		To:           []string{author},
+		Cc:           []string{asPublic},
 	}
-	create := activity{Context: asContext, ID: n.ID + "#create", Type: typeCreate, Actor: actorID, Object: n, To: []string{asPublic}}
+	create := activity{Context: asContext, ID: n.ID + "#create", Type: typeCreate, Actor: actorID, Object: n, To: []string{author}, Cc: []string{asPublic}}
 	return b.ap.postSigned(ctx, localUser, inbox, create)
 }
 
