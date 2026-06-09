@@ -187,6 +187,24 @@ func (g *gateway) apGetTweets(ctx context.Context, handle string, cursor *string
 		if obj == nil {
 			continue
 		}
+		// A boost: Announce wraps the URL of someone else's Note. Fetch it and
+		// mark it retweeted by this actor.
+		if asString(obj["type"]) == typeAnnounce {
+			boosted := asString(obj["object"])
+			if boosted == "" {
+				continue
+			}
+			bm, berr := g.apGetJSON(ctx, boosted, contentTypeAP)
+			if berr != nil {
+				continue
+			}
+			if t, ok := g.apNoteToTweet(handleFromActorURL(asString(bm["attributedTo"])), bm); ok {
+				by := handle
+				t.RetweetedBy = &by
+				resp.Tweets = append(resp.Tweets, t)
+			}
+			continue
+		}
 		// orderedItems are activities (Create) wrapping the Note, or bare Notes.
 		note := obj
 		if inner := asMap(obj["object"]); inner != nil {
@@ -197,6 +215,124 @@ func (g *gateway) apGetTweets(ctx context.Context, handle string, cursor *string
 		}
 	}
 	return resp, nil
+}
+
+// apGetTweetStats reads the engagement counts Mastodon exposes on a Note
+// (likes/shares/replies collections carry totalItems).
+func (g *gateway) apGetTweetStats(ctx context.Context, noteURL string) (event.TweetStatsResponse, error) {
+	noteURL = strings.TrimPrefix(noteURL, domain.RetweetPrefix)
+	m, err := g.apGetJSON(ctx, noteURL, contentTypeAP)
+	if err != nil {
+		return event.TweetStatsResponse{}, err
+	}
+	if inner := asMap(m["object"]); inner != nil {
+		m = inner
+	}
+	return event.TweetStatsResponse{
+		TweetId:       domain.ID(noteURL),
+		LikeCount:     apCollectionCount(m["likes"]),
+		RetweetsCount: apCollectionCount(m["shares"]),
+		RepliesCount:  apCollectionCount(m["replies"]),
+	}, nil
+}
+
+// apGetFollowers / apGetFollowings resolve the actor's follower/following
+// collections to Warpnet user ids (Fediverse handles). Many instances hide the
+// member lists and expose only totalItems; then the returned list is empty.
+func (g *gateway) apGetFollowers(ctx context.Context, handle string, cursor *string) (event.FollowersResponse, error) {
+	ids, next, err := g.apFollowList(ctx, handle, cursor, "followers")
+	if err != nil {
+		return event.FollowersResponse{}, err
+	}
+	return event.FollowersResponse{FollowingId: handle, Followers: ids, Cursor: next}, nil
+}
+
+func (g *gateway) apGetFollowings(ctx context.Context, handle string, cursor *string) (event.FollowingsResponse, error) {
+	ids, next, err := g.apFollowList(ctx, handle, cursor, "following")
+	if err != nil {
+		return event.FollowingsResponse{}, err
+	}
+	return event.FollowingsResponse{FollowerId: handle, Followings: ids, Cursor: next}, nil
+}
+
+func (g *gateway) apFollowList(ctx context.Context, handle string, cursor *string, field string) ([]string, string, error) {
+	pageURL := ""
+	if cursor != nil {
+		pageURL = *cursor
+	}
+	if pageURL == "" {
+		actorURL, err := g.apResolveHandle(ctx, handle)
+		if err != nil {
+			return nil, "", err
+		}
+		actor, err := g.fetchActor(ctx, actorURL)
+		if err != nil {
+			return nil, "", err
+		}
+		coll := asString(actor[field])
+		if coll == "" {
+			return []string{}, "", nil
+		}
+		page, perr := g.apGetJSON(ctx, coll, contentTypeAP)
+		if perr != nil {
+			return []string{}, "", nil //nolint:nilerr // hidden collection -> empty, not an error
+		}
+		hasItems := len(asSlice(page["orderedItems"])) > 0 || len(asSlice(page["items"])) > 0
+		if first := asString(page["first"]); first != "" && !hasItems {
+			pageURL = first
+		} else {
+			return collectHandles(page), asString(page["next"]), nil
+		}
+	}
+	page, err := g.apGetJSON(ctx, pageURL, contentTypeAP)
+	if err != nil {
+		return []string{}, "", nil //nolint:nilerr // hidden collection -> empty, not an error
+	}
+	return collectHandles(page), asString(page["next"]), nil
+}
+
+// collectHandles maps a collection page's actor-URL items to Fediverse handles.
+func collectHandles(page map[string]any) []string {
+	items := asSlice(page["orderedItems"])
+	if len(items) == 0 {
+		items = asSlice(page["items"])
+	}
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		if u := asString(it); u != "" {
+			out = append(out, handleFromActorURL(u))
+		}
+	}
+	return out
+}
+
+// apCollectionCount reads totalItems off an AP Collection value.
+func apCollectionCount(v any) uint64 {
+	m := asMap(v)
+	if m == nil {
+		return 0
+	}
+	if n, ok := m["totalItems"].(float64); ok && n > 0 {
+		return uint64(n)
+	}
+	return 0
+}
+
+// objectAuthorInbox fetches an object (Note) and resolves its author's inbox,
+// for delivering Like/Announce/Create back to the originating instance.
+func (g *gateway) objectAuthorInbox(ctx context.Context, objectURL string) (string, error) {
+	m, err := g.apGetJSON(ctx, objectURL, contentTypeAP)
+	if err != nil {
+		return "", err
+	}
+	if inner := asMap(m["object"]); inner != nil {
+		m = inner
+	}
+	author := asString(m["attributedTo"])
+	if author == "" {
+		return "", fmt.Errorf("apsource: object %s has no attributedTo", objectURL)
+	}
+	return g.remoteInbox(ctx, author)
 }
 
 // apGetTweet fetches a single Note by its id (the AP object URL stored as the

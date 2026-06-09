@@ -44,7 +44,6 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/Warp-net/warpnet/core/warpnet"
-	"github.com/Warp-net/warpnet/domain"
 	"github.com/Warp-net/warpnet/event"
 	wjson "github.com/Warp-net/warpnet/json"
 	"github.com/Warp-net/warpnet/security"
@@ -81,11 +80,15 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 		routeGetImage:                wrapJSON(g.handleGetImage),
 		event.PUBLIC_GET_TWEET_STATS: wrapJSON(g.handleGetTweetStats),
 		event.PUBLIC_POST_VIEW:       func(context.Context, []byte) (any, error) { return event.ViewsCountResponse{Count: 1}, nil },
-	}
-	// Write routes (a Warpnet user acting on a Mastodon account/post) are
-	// acknowledged but not yet federated outbound — read-only bridge for now.
-	for _, w := range []string{routePostFollow, routePostUnfollow, routePostLike, routePostUnlike, routePostRetweet, routePostUnretweet, routePostReply} {
-		handlers[w] = ackWrite(w)
+		// Write routes federate the Warpnet action onto Mastodon as a signed
+		// ActivityPub activity (Mastodon -> star/boost/reply/follow).
+		routePostLike:      wrapJSON(g.handleLike),
+		routePostUnlike:    wrapJSON(g.handleUnlike),
+		routePostFollow:    wrapJSON(g.handleFollow),
+		routePostUnfollow:  wrapJSON(g.handleUnfollow),
+		routePostReply:     wrapJSON(g.handleReply),
+		routePostRetweet:   wrapJSON(g.handleRetweet),
+		routePostUnretweet: wrapJSON(g.handleUnretweet),
 	}
 
 	for route, h := range handlers {
@@ -186,32 +189,102 @@ func (g *gateway) handleGetReplies(ctx context.Context, ev getTweetEvent) (any, 
 	return g.apGetReplies(ctx, ev.TweetId)
 }
 
-// handleGetTweetStats reads engagement counts off the Note (favourites/shares/
-// replies are Mastodon extensions; absent on many servers -> zero).
-func (g *gateway) handleGetTweetStats(_ context.Context, ev getTweetEvent) (any, error) {
-	return event.TweetStatsResponse{TweetId: domain.ID(ev.TweetId)}, nil
+// handleGetTweetStats reads the like/boost/reply counts Mastodon publishes on
+// the Note's likes/shares/replies collections.
+func (g *gateway) handleGetTweetStats(ctx context.Context, ev getTweetEvent) (any, error) {
+	return g.apGetTweetStats(ctx, ev.TweetId)
 }
 
-// handleGetFollowers / handleGetFollowings: Mastodon follower lists are usually
-// not publicly dereferenceable, so the bridge returns an empty list.
-func (g *gateway) handleGetFollowers(_ context.Context, ev getFollowersEvent) (any, error) {
-	return event.FollowersResponse{FollowingId: ev.UserId, Followers: []string{}}, nil
+func (g *gateway) handleGetFollowers(ctx context.Context, ev getFollowersEvent) (any, error) {
+	return g.apGetFollowers(ctx, ev.UserId, ev.Cursor)
 }
 
-func (g *gateway) handleGetFollowings(_ context.Context, ev getFollowersEvent) (any, error) {
-	return event.FollowingsResponse{FollowerId: ev.UserId, Followings: []string{}}, nil
+func (g *gateway) handleGetFollowings(ctx context.Context, ev getFollowersEvent) (any, error) {
+	return g.apGetFollowings(ctx, ev.UserId, ev.Cursor)
 }
 
 func (g *gateway) handleGetImage(ctx context.Context, ev getImageEvent) (any, error) {
 	return g.apGetImage(ctx, ev.Key)
 }
 
-// ackWrite acknowledges a write route without federating it (read-only bridge).
-func ackWrite(route string) routeHandler {
-	return func(context.Context, []byte) (any, error) {
-		log.Infof("nodeserver: %s acknowledged (outbound federation not implemented)", route)
-		return struct{}{}, nil
+// handleLike federates a Warpnet like onto Mastodon as a Like activity
+// (Mastodon shows it as a favourite/star) and reports the status's like count.
+func (g *gateway) handleLike(ctx context.Context, ev likeEvent) (any, error) {
+	if err := g.deliverLike(ctx, string(ev.UserId), string(ev.TweetId), false); err != nil {
+		return nil, err
 	}
+	stats, _ := g.apGetTweetStats(ctx, string(ev.TweetId))
+	return event.LikesCountResponse{Count: stats.LikeCount}, nil
+}
+
+func (g *gateway) handleUnlike(ctx context.Context, ev likeEvent) (any, error) {
+	if err := g.deliverLike(ctx, string(ev.UserId), string(ev.TweetId), true); err != nil {
+		return nil, err
+	}
+	stats, _ := g.apGetTweetStats(ctx, string(ev.TweetId))
+	return event.LikesCountResponse{Count: stats.LikeCount}, nil
+}
+
+func (g *gateway) handleFollow(ctx context.Context, ev newFollowEvent) (any, error) {
+	actorURL, err := g.apResolveHandle(ctx, string(ev.FollowingId))
+	if err != nil {
+		return nil, err
+	}
+	g.deliverFollow(string(ev.FollowerId), actorURL, false)
+	return struct{}{}, nil
+}
+
+func (g *gateway) handleUnfollow(ctx context.Context, ev newFollowEvent) (any, error) {
+	actorURL, err := g.apResolveHandle(ctx, string(ev.FollowingId))
+	if err != nil {
+		return nil, err
+	}
+	g.deliverFollow(string(ev.FollowerId), actorURL, true)
+	return struct{}{}, nil
+}
+
+// handleReply federates a Warpnet reply as a Create(Note) inReplyTo the Mastodon
+// status, and echoes the reply back so the Warpnet UI renders it.
+func (g *gateway) handleReply(ctx context.Context, ev newReplyEvent) (any, error) {
+	if err := g.deliverReply(ctx, ev); err != nil {
+		return nil, err
+	}
+	parent := string(ev.RootId)
+	if ev.ParentId != nil {
+		parent = string(*ev.ParentId)
+	}
+	return tweet{
+		Id:        string(ev.Id),
+		ParentId:  &parent,
+		RootId:    string(ev.RootId),
+		Text:      ev.Text,
+		UserId:    string(ev.UserId),
+		Username:  ev.Username,
+		CreatedAt: ev.CreatedAt,
+		Network:   mastodonNetwork,
+	}, nil
+}
+
+func (g *gateway) handleRetweet(ctx context.Context, ev tweet) (any, error) {
+	retweeter := ev.UserId
+	if ev.RetweetedBy != nil && *ev.RetweetedBy != "" {
+		retweeter = *ev.RetweetedBy
+	}
+	object := ev.Id
+	if object == "" {
+		object = ev.RootId
+	}
+	if err := g.deliverAnnounce(ctx, retweeter, object, false); err != nil {
+		return nil, err
+	}
+	return ev, nil
+}
+
+func (g *gateway) handleUnretweet(ctx context.Context, ev unretweetEvent) (any, error) {
+	if err := g.deliverAnnounce(ctx, string(ev.RetweeterId), string(ev.TweetId), true); err != nil {
+		return nil, err
+	}
+	return struct{}{}, nil
 }
 
 // wrapJSON adapts a typed handler to a routeHandler by decoding the request body
