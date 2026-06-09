@@ -27,10 +27,6 @@ func testGateway(t *testing.T) *gateway {
 	if err != nil {
 		t.Fatalf("pub: %v", err)
 	}
-	fs, err := newFileFollowerStore(t.TempDir() + "/followers.json")
-	if err != nil {
-		t.Fatalf("followers: %v", err)
-	}
 	return &gateway{
 		host:                "gw.example",
 		key:                 key,
@@ -39,7 +35,7 @@ func testGateway(t *testing.T) *gateway {
 		signingUser:         "alice",
 		client:              http.DefaultClient,
 		sem:                 make(chan struct{}, 4),
-		followers:           fs,
+		followers:           newMemFollowerStore(),
 		allowPrivateTargets: true,
 	}
 }
@@ -130,28 +126,16 @@ func TestHTTPSignatureRoundTrip(t *testing.T) {
 	})
 }
 
-func TestFileFollowerStore(t *testing.T) {
-	path := t.TempDir() + "/f.json"
-	s, err := newFileFollowerStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestMemFollowerStore(t *testing.T) {
+	s := newMemFollowerStore()
 	if err := s.Add("alice", "https://m/users/bob"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Add("alice", "https://m/users/bob"); err != nil { // idempotent
 		t.Fatal(err)
 	}
-	if got, _ := s.List("alice"); len(got) != 1 {
-		t.Fatalf("want 1 follower, got %d", len(got))
-	}
-	// reload from disk sees the persisted follower
-	s2, err := newFileFollowerStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := s2.List("alice"); len(got) != 1 || got[0] != "https://m/users/bob" {
-		t.Fatalf("reloaded store mismatch: %+v", got)
+	if got, _ := s.List("alice"); len(got) != 1 || got[0] != "https://m/users/bob" {
+		t.Fatalf("want 1 follower, got %+v", got)
 	}
 }
 

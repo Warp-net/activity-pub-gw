@@ -40,6 +40,7 @@ import (
 // Public-route protocol IDs (each is also the libp2p protocol string).
 const (
 	routeGetUser       = event.PUBLIC_GET_USER
+	routeGetUsers      = event.PUBLIC_GET_USERS
 	routeGetTweet      = event.PUBLIC_GET_TWEET
 	routeGetTweets     = event.PUBLIC_GET_TWEETS
 	routeGetReplies    = event.PUBLIC_GET_REPLIES
@@ -65,6 +66,8 @@ type (
 // Request/response event payloads (warpnet's own types).
 type (
 	getUserEvent       = event.GetUserEvent
+	getAllUsersEvent   = event.GetAllUsersEvent
+	usersResponse      = event.UsersResponse
 	getTweetEvent      = event.GetTweetEvent
 	getAllTweetsEvent  = event.GetAllTweetsEvent
 	tweetsResponse     = event.TweetsResponse
