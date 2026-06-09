@@ -142,6 +142,7 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 func (c *nodeClient) streamHandler(route string, h routeHandler) network.StreamHandler {
 	return func(s network.Stream) {
 		defer func() { _ = s.Close() }()
+		start := time.Now()
 
 		data, err := io.ReadAll(io.LimitReader(s, maxRequestBytes))
 		if err != nil {
@@ -182,6 +183,9 @@ func (c *nodeClient) streamHandler(route string, h routeHandler) network.StreamH
 		if _, werr := s.Write(out); werr != nil {
 			log.Warnf("nodeserver: %s: write: %v", route, werr)
 		}
+		// Per-request timing: lets gateway latency be measured against node-side
+		// logs when diagnosing slow bridged requests.
+		log.Infof("nodeserver: %s: served in %s", route, time.Since(start))
 	}
 }
 
