@@ -48,7 +48,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	noise "github.com/libp2p/go-libp2p/p2p/security/noise"
-	"github.com/multiformats/go-multiaddr"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -146,22 +145,12 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 		libp2p.Ping(true),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.EnableRelay(),
-		// The gateway now also serves inbound /public routes (Mastodon -> Warpnet),
-		// so it must be a dialable, discoverable peer. It is deployed on a public
-		// libp2p address; advertise public reachability so member nodes treat it
-		// as such instead of probing it as a NAT'd peer.
-		libp2p.ForceReachabilityPublic(),
-	}
-	// Announce an explicit public multiaddr when provided (the listen address is
-	// often 0.0.0.0 / behind a published port).
-	if ann := envOr("GATEWAY_P2P_ANNOUNCE", ""); ann != "" {
-		maddr, merr := multiaddr.NewMultiaddr(ann)
-		if merr != nil {
-			return nil, fmt.Errorf("nodeclient: bad GATEWAY_P2P_ANNOUNCE: %w", merr)
-		}
-		opts = append(opts, libp2p.AddrsFactory(func([]multiaddr.Multiaddr) []multiaddr.Multiaddr {
-			return []multiaddr.Multiaddr{maddr}
-		}))
+		// Reach the gateway ONLY through the network's relays (security): force
+		// private reachability so it never advertises a direct address, and take
+		// circuit-relay reservations on the bootstrap relays, like a NAT'd member
+		// node. Member nodes dial it over the relay; it is never directly exposed.
+		libp2p.ForceReachabilityPrivate(),
+		libp2p.EnableAutoRelayWithStaticRelays(entries),
 	}
 
 	h, err := libp2p.New(opts...)
@@ -170,8 +159,8 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 	}
 
 	// Join Warpnet's Kademlia DHT (prefix "/<network>", bootstrapped via the
-	// relays) as a server so member nodes add the gateway to their routing tables
-	// and discover it as a regular peer.
+	// relays) as a server so member nodes can still resolve the gateway's
+	// circuit address via FindPeer, even though it is only reachable via relays.
 	kdht, err := dht.New(ctx, h,
 		dht.Mode(dht.ModeServer),
 		dht.ProtocolPrefix(protocol.ID("/"+network)),
