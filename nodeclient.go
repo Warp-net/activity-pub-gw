@@ -187,7 +187,7 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 	case <-time.After(20 * time.Second):
 	case <-ctx.Done():
 	}
-	log.Infof("nodeclient: joined Warpnet (%s) via %d relay(s); discovering members via DHT", network, connected)
+	log.Infof("nodeclient %v: joined Warpnet (%s) via %d relay(s); discovering members via DHT", h.ID(), network, connected)
 
 	return &nodeClient{h: h, priv: priv, dht: kdht, relays: relays, owner: map[string]peer.ID{}}, nil
 }
