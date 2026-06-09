@@ -73,7 +73,7 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 		routeGetUser: wrapJSON(func(ctx context.Context, ev getUserEvent) (any, error) {
 			return b.GetUser(ctx, string(ev.UserId))
 		}),
-		event.PUBLIC_GET_USERS: wrapJSON(func(ctx context.Context, ev getAllTweetsEvent) (any, error) {
+		routeGetUsers: wrapJSON(func(ctx context.Context, ev getAllUsersEvent) (any, error) {
 			u, err := b.GetUser(ctx, string(ev.UserId))
 			if err != nil {
 				return event.UsersResponse{}, nil //nolint:nilerr // unknown handle -> empty
