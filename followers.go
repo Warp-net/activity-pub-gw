@@ -29,9 +29,7 @@ package main
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -39,9 +37,9 @@ import (
 
 // followerStore records, per local (bridged) user, the remote Fediverse actors
 // that follow them. The production path (nodeFollowerStore) keeps the follow
-// graph in Warpnet via the existing follow routes; fileFollowerStore is a local
-// dev fallback when no Warpnet node is configured. Either way the gateway keeps
-// only keys, not Warpnet content.
+// graph in Warpnet via the existing follow routes; memFollowerStore is an
+// in-memory dev fallback when no Warpnet node is configured. Either way the
+// gateway persists only its keys, never Warpnet content.
 type followerStore interface {
 	Add(localUser, actorURL string) error
 	List(localUser string) ([]string, error)
@@ -74,46 +72,28 @@ func decodeActorID(id string) (string, error) {
 	return string(bt), nil
 }
 
-// fileFollowerStore is a JSON-backed dev fallback used only when the gateway has
-// no Warpnet node connection.
-type fileFollowerStore struct {
+// memFollowerStore is an in-memory dev fallback used only when the gateway has
+// no Warpnet node connection. Nothing touches the disk (see CLAUDE.md).
+type memFollowerStore struct {
 	mu   sync.RWMutex
-	path string
 	data map[string][]string // localUser -> actor URLs
 }
 
-func newFileFollowerStore(path string) (*fileFollowerStore, error) {
-	s := &fileFollowerStore{path: path, data: map[string][]string{}}
-	bt, err := os.ReadFile(path) //#nosec G304 -- operator-provided path
-	if err != nil {
-		if os.IsNotExist(err) {
-			return s, nil
-		}
-		return nil, err
-	}
-	if len(bt) > 0 {
-		if err := json.Unmarshal(bt, &s.data); err != nil {
-			return nil, err
-		}
-	}
-	return s, nil
+func newMemFollowerStore() *memFollowerStore {
+	return &memFollowerStore{data: map[string][]string{}}
 }
 
-func (s *fileFollowerStore) Add(localUser, actorURL string) error {
+func (s *memFollowerStore) Add(localUser, actorURL string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if slices.Contains(s.data[localUser], actorURL) {
 		return nil
 	}
 	s.data[localUser] = append(s.data[localUser], actorURL)
-	bt, err := json.Marshal(s.data)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(s.path, bt, 0o600) //#nosec G703 -- operator-provided path
+	return nil
 }
 
-func (s *fileFollowerStore) List(localUser string) ([]string, error) {
+func (s *memFollowerStore) List(localUser string) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	src := s.data[localUser]

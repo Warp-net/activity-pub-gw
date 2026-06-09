@@ -63,7 +63,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.29"
+const gatewayVersion = "0.1.30"
 
 const fatalFmt = "gateway: %v"
 
@@ -80,10 +80,9 @@ func main() {
 	}
 
 	var (
-		host          = envOr("GATEWAY_HOST", "")
-		addr          = envOr("GATEWAY_ADDR", "127.0.0.1:8080")
-		keyPath       = envOr("GATEWAY_KEY", "fediverse-gateway-key.pem")
-		followersPath = envOr("GATEWAY_FOLLOWERS", "fediverse-gateway-followers.json")
+		host    = envOr("GATEWAY_HOST", "")
+		addr    = envOr("GATEWAY_ADDR", "127.0.0.1:8080")
+		keyPath = envOr("GATEWAY_KEY", "fediverse-gateway-key.pem")
 	)
 
 	// Self-host the public endpoint via embedded Tailscale Funnel by default: the
@@ -139,19 +138,14 @@ func main() {
 
 	// The follower graph lives in Warpnet, read/written through the owner member
 	// node via the node connector (owner-targeted routes). Only when no node is
-	// configured does the gateway fall back to a local dev store.
+	// configured does the gateway fall back to an in-memory dev store.
 	var followers followerStore
 	var req nodeRequester
 	if nodeCli != nil {
 		followers = nodeFollowerStore{req: nodeCli}
 		req = nodeCli
 	} else {
-		ff, ferr := newFileFollowerStore(followersPath)
-		if ferr != nil {
-			appCancel()
-			log.Fatalf(fatalFmt, ferr)
-		}
-		followers = ff
+		followers = newMemFollowerStore()
 	}
 
 	g := &gateway{

@@ -13,10 +13,10 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 FROM gcr.io/distroless/static-debian12
 
-# Persisted state — RSA signing key, follower fallback, and the Tailscale node
-# identity (keeps the *.ts.net hostname stable across restarts) — lives in /data.
+# Persisted state — the RSA signing key and the Tailscale node identity (keeps
+# the *.ts.net hostname stable across restarts) — lives in /data. Nothing else
+# is ever written to disk (see CLAUDE.md).
 ENV GATEWAY_KEY=/data/key.pem \
-    GATEWAY_FOLLOWERS=/data/followers.json \
     GATEWAY_FUNNEL_DIR=/data/tsnet
 VOLUME ["/data"]
 
