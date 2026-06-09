@@ -30,7 +30,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"sync"
 	"time"
 
@@ -45,11 +44,11 @@ type outboundFederation struct {
 	req     nodeRequester
 	g       *gateway
 	mu      sync.Mutex
-	started map[string]bool
+	started map[string]context.CancelFunc
 }
 
 func newOutboundFederation(ctx context.Context, req nodeRequester, g *gateway) *outboundFederation {
-	return &outboundFederation{ctx: ctx, req: req, g: g, started: map[string]bool{}}
+	return &outboundFederation{ctx: ctx, req: req, g: g, started: map[string]context.CancelFunc{}}
 }
 
 // start begins federating localUser's posts and outbound follows; idempotent per
@@ -60,20 +59,34 @@ func (o *outboundFederation) start(localUser string) {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.started[localUser] {
+	if _, ok := o.started[localUser]; ok {
 		return
 	}
-	o.started[localUser] = true
+	ctx, cancel := context.WithCancel(o.ctx)
+	o.started[localUser] = cancel
 	log.Infof("outbound: federating %s", localUser)
-	go newTweetPoller(o.req, localUser, o.g.publishNote).run(o.ctx)
+	go newTweetPoller(o.req, localUser, o.g.publishNote).run(ctx)
 	go newFollowPoller(o.req, localUser,
 		func(actorURL string) { o.g.sendFollow(localUser, actorURL) },
 		func(actorURL string) { o.g.sendUndoFollow(localUser, actorURL) },
-	).run(o.ctx)
+	).run(ctx)
 	// Refresh followers' cached profile (badge, avatar, bio) once federation
 	// (re)starts — e.g. after a redeploy — since Mastodon won't re-fetch the
 	// actor on its own.
-	go o.g.sendActorUpdate(o.ctx, localUser)
+	go o.g.sendActorUpdate(ctx, localUser)
+}
+
+// stop cancels localUser's pollers (their last Fediverse follower is gone).
+func (o *outboundFederation) stop(localUser string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	cancel, ok := o.started[localUser]
+	if !ok {
+		return
+	}
+	delete(o.started, localUser)
+	cancel()
+	log.Infof("outbound: stopped federating %s", localUser)
 }
 
 const followPollInterval = 30 * time.Second
@@ -200,52 +213,67 @@ func (g *gateway) deliverFollow(localUser, remoteActorURL string, undo bool) {
 	log.Infof("follow: delivered to %s (undo=%v)", remoteActorURL, undo)
 }
 
-// federatedStore persists the set of local users the gateway federates outbound
-// (those that gained a Fediverse follower) so federation resumes after a
-// restart — the in-memory started map alone forgets them and stops polling.
-type federatedStore struct {
-	path string
-	mu   sync.Mutex
-	set  map[string]struct{}
+const (
+	federationScanInterval = 5 * time.Minute
+	federationScanPageSize = uint64(100)
+	federationScanMaxPages = 100
+)
+
+// runScanner derives the federated set from the follow graph stored in Warpnet
+// (users with at least one ap: follower) on startup and periodically, so the
+// gateway persists nothing locally: federation resumes after a restart from the
+// network alone, and stops when a user's last Fediverse follower unfollows.
+// scanUser is the user id sent with the listing request (the node requires one).
+func (o *outboundFederation) runScanner(scanUser string) {
+	for {
+		o.scan(scanUser)
+		select {
+		case <-o.ctx.Done():
+			return
+		case <-time.After(federationScanInterval):
+		}
+	}
 }
 
-func newFederatedStore(path string) *federatedStore {
-	s := &federatedStore{path: path, set: map[string]struct{}{}}
-	if bt, err := os.ReadFile(path); err == nil {
-		var ids []string
-		if json.Unmarshal(bt, &ids) == nil {
-			for _, id := range ids {
-				s.set[id] = struct{}{}
+// scan pages through the users known to the network and reconciles pollers with
+// the ap: follower graph. Users whose follower list could not be read are left
+// untouched (never stopped on a transient error).
+func (o *outboundFederation) scan(scanUser string) {
+	followers := nodeFollowerStore{req: o.req}
+	limit := federationScanPageSize
+	var cursor string
+	for range federationScanMaxPages {
+		ev := getAllUsersEvent{UserId: scanUser, Limit: &limit}
+		if cursor != "" {
+			ev.Cursor = &cursor
+		}
+		bt, err := o.req.request(routeGetUsers, ev)
+		if err != nil {
+			log.Warnf("outbound: scan users: %v", err)
+			return
+		}
+		var resp usersResponse
+		if uerr := json.Unmarshal(bt, &resp); uerr != nil {
+			log.Warnf("outbound: scan users: bad response: %v", uerr)
+			return
+		}
+		for _, u := range resp.Users {
+			if u.Network == mastodonNetwork { // bridged account, lives in Mastodon already
+				continue
+			}
+			urls, ferr := followers.List(u.Id)
+			if ferr != nil {
+				continue
+			}
+			if len(urls) > 0 {
+				o.start(u.Id)
+			} else {
+				o.stop(u.Id)
 			}
 		}
-	}
-	return s
-}
-
-func (s *federatedStore) list() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]string, 0, len(s.set))
-	for id := range s.set {
-		out = append(out, id)
-	}
-	return out
-}
-
-func (s *federatedStore) add(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.set[id]; ok {
-		return
-	}
-	s.set[id] = struct{}{}
-	ids := make([]string, 0, len(s.set))
-	for x := range s.set {
-		ids = append(ids, x)
-	}
-	if bt, err := json.Marshal(ids); err == nil {
-		if werr := os.WriteFile(s.path, bt, 0o600); werr != nil {
-			log.Warnf("federated: persist %s: %v", s.path, werr)
+		if len(resp.Users) == 0 || resp.Cursor == "" || resp.Cursor == cursor {
+			return
 		}
+		cursor = resp.Cursor
 	}
 }
