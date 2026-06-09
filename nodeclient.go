@@ -52,7 +52,7 @@ import (
 )
 
 var (
-	errNoEntryPeers     = errors.New("no Warpnet entry peers (set NODE_NETWORK or GATEWAY_NODE_ADDR)")
+	errNoEntryPeers     = errors.New("no Warpnet entry peers (check NODE_NETWORK)")
 	errNoEntryReachable = errors.New("nodeclient: no Warpnet entry peer reachable")
 )
 
@@ -69,8 +69,7 @@ type nodeClient struct {
 	owner map[string]peer.ID // userID -> its home node (domain.User.NodeId); user-scoped routes target it
 }
 
-// networkEntries are the network's bootstrap relays (the DHT entry points) plus
-// an optional explicit GATEWAY_NODE_ADDR.
+// networkEntries are the network's bootstrap relays (the DHT entry points).
 func networkEntries(network string) ([]peer.AddrInfo, error) {
 	var entries []peer.AddrInfo
 	for _, s := range bootstrapByNetwork[network] {
@@ -78,13 +77,6 @@ func networkEntries(network string) ([]peer.AddrInfo, error) {
 		if err != nil {
 			log.Warnf("nodeclient: bad bootstrap %q: %v", s, err)
 			continue
-		}
-		entries = append(entries, *ai)
-	}
-	if extra := envOr("GATEWAY_NODE_ADDR", ""); extra != "" {
-		ai, err := peer.AddrInfoFromString(extra)
-		if err != nil {
-			return nil, fmt.Errorf("bad GATEWAY_NODE_ADDR: %w", err)
 		}
 		entries = append(entries, *ai)
 	}
@@ -107,7 +99,7 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 	// restarts so the node_id carried on bridged Mastodon users keeps resolving
 	// back to this gateway (a rotating id would orphan them). Same derivation as
 	// a Warpnet member node (security.GenerateKeyFromSeed).
-	priv, err := security.GenerateKeyFromSeed([]byte(envOr("GATEWAY_SEED", defaultGatewaySeed)))
+	priv, err := security.GenerateKeyFromSeed([]byte(defaultGatewaySeed))
 	if err != nil {
 		return nil, fmt.Errorf("nodeclient: identity: %w", err)
 	}
@@ -139,7 +131,7 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 		libp2p.ResourceManager(rm),
 		libp2p.Identity(p2pPriv),
 		libp2p.PrivateNetwork(pnet.PSK(psk)),
-		libp2p.ListenAddrStrings(envOr("GATEWAY_P2P_LISTEN", defaultP2PListen)),
+		libp2p.ListenAddrStrings(defaultP2PListen),
 		libp2p.WithDialTimeout(60 * time.Second),
 		libp2p.Transport(camouflage.NewCamouflageTransport),
 		libp2p.Ping(true),
@@ -329,31 +321,4 @@ func (s nodeSource) GetUser(preferredUsername string) (warpnetUser, bool) {
 		Avatar:            u.AvatarKey,
 		Background:        u.BackgroundImageKey,
 	}, true
-}
-
-// runProbe joins Warpnet and fetches the GATEWAY_USER profile — a smoke test of
-// the connector path.
-func runProbe() {
-	u := envOr("GATEWAY_USER", "")
-	if u == "" {
-		log.Errorln("probe: set GATEWAY_USER (and optionally GATEWAY_NODE_ADDR)")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	cl, err := connectNetwork(ctx)
-	if err != nil {
-		log.Errorf("probe: connect: %v", err)
-		return
-	}
-	defer cl.close()
-
-	wu, ok := nodeSource{client: cl}.GetUser(u)
-	if !ok {
-		log.Errorln("probe: user not found / unreadable")
-		return
-	}
-	log.Infof("probe: OK — user id=%s name=%q bio=%q", wu.ID, wu.DisplayName, wu.Summary)
 }

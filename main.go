@@ -35,18 +35,17 @@ resulting from the use or misuse of this software.
 // Implemented: WebFinger, an actor document with an RSA public key, an inbox
 // that verifies HTTP signatures and answers Follow with a signed Accept
 // (persisting the follower), outbound Create(Note) fan-out, and a libp2p
-// connector to the Warpnet network (GATEWAY_PROBE smoke-tests it against
-// GATEWAY_NODE_ADDR).
+// connector to the Warpnet network.
 //
-// Configuration is environment-only (GATEWAY_* below, plus the standard
-// NODE_NETWORK for the libp2p side). It does NOT use CLI flags: importing the
-// libp2p stack pulls in config.init's pflag.Parse, which would clash with a
-// second flag set, and every other Warpnet node is env-configured too.
+// Configuration is environment-only and intentionally minimal: GATEWAY_KEY,
+// GATEWAY_FUNNEL_DIR, GATEWAY_FUNNEL_HOSTNAME, TS_AUTHKEY, and the standard
+// NODE_NETWORK. It does NOT use CLI flags: importing the libp2p stack pulls in
+// config.init's pflag.Parse, which would clash with a second flag set, and
+// every other Warpnet node is env-configured too.
 //
 // The gateway keeps only keys on disk (RSA signing key); profile/followers
-// live in Warpnet. It is meant to run behind a tunnel that terminates TLS
-// (Tailscale Funnel, Cloudflare Tunnel, …); GATEWAY_HOST is the public
-// hostname that tunnel exposes.
+// live in Warpnet. The public endpoint is self-hosted via embedded Tailscale
+// Funnel, which terminates TLS and pins the hostname.
 package main
 
 import (
@@ -63,7 +62,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.31"
+const gatewayVersion = "0.1.32"
 
 const fatalFmt = "gateway: %v"
 
@@ -73,44 +72,29 @@ func main() {
 	log.SetLevel(log.InfoLevel)
 	log.Infof("gateway: starting version %s", gatewayVersion)
 
-	// Smoke-test the libp2p connector against the configured Warpnet node.
-	if envOr("GATEWAY_PROBE", "") != "" {
-		runProbe()
-		return
-	}
+	keyPath := envOr("GATEWAY_KEY", "fediverse-gateway-key.pem")
 
-	var (
-		host    = envOr("GATEWAY_HOST", "")
-		addr    = envOr("GATEWAY_ADDR", "127.0.0.1:8080")
-		keyPath = envOr("GATEWAY_KEY", "fediverse-gateway-key.pem")
-	)
-
-	// Self-host the public endpoint via embedded Tailscale Funnel by default: the
-	// gateway becomes its own tailnet node and ListenFunnel (below) serves public
-	// HTTPS with an auto-provisioned *.ts.net cert, deriving host from the node.
-	// The persisted Dir keeps the hostname stable across restarts (a rotating
-	// name orphans existing followers). Setting GATEWAY_HOST opts out — it means
-	// you front the gateway yourself (external tunnel / reverse proxy), so it
-	// serves plain HTTP on GATEWAY_ADDR instead.
-	var ts *tsnet.Server
-	if host == "" {
-		ts = &tsnet.Server{
-			Hostname: envOr("GATEWAY_FUNNEL_HOSTNAME", "warpnet-gw"),
-			Dir:      envOr("GATEWAY_FUNNEL_DIR", "fediverse-gateway-tsnet"),
-			AuthKey:  os.Getenv("TS_AUTHKEY"),
-			UserLogf: log.Infof,
-			Logf:     log.Debugf,
-		}
-		st, uerr := ts.Up(context.Background())
-		if uerr != nil {
-			log.Fatalf("gateway: tailscale funnel: %v", uerr)
-		}
-		if st.Self == nil || st.Self.DNSName == "" {
-			log.Fatalln("gateway: tailscale funnel: node has no DNS name (enable MagicDNS + HTTPS for the tailnet)")
-		}
-		host = strings.TrimSuffix(st.Self.DNSName, ".")
-		log.Infof("gateway: tailscale funnel node up as %s", host)
+	// Self-host the public endpoint via embedded Tailscale Funnel: the gateway
+	// becomes its own tailnet node and ListenFunnel (below) serves public HTTPS
+	// with an auto-provisioned *.ts.net cert, deriving host from the node. The
+	// persisted Dir keeps the hostname stable across restarts (a rotating name
+	// orphans existing followers).
+	ts := &tsnet.Server{
+		Hostname: envOr("GATEWAY_FUNNEL_HOSTNAME", "warpnet-gw"),
+		Dir:      envOr("GATEWAY_FUNNEL_DIR", "fediverse-gateway-tsnet"),
+		AuthKey:  os.Getenv("TS_AUTHKEY"),
+		UserLogf: log.Infof,
+		Logf:     log.Debugf,
 	}
+	st, uerr := ts.Up(context.Background())
+	if uerr != nil {
+		log.Fatalf("gateway: tailscale funnel: %v", uerr)
+	}
+	if st.Self == nil || st.Self.DNSName == "" {
+		log.Fatalln("gateway: tailscale funnel: node has no DNS name (enable MagicDNS + HTTPS for the tailnet)")
+	}
+	host := strings.TrimSuffix(st.Self.DNSName, ".")
+	log.Infof("gateway: tailscale funnel node up as %s", host)
 
 	key, err := loadOrCreateKey(keyPath)
 	if err != nil {
@@ -164,7 +148,7 @@ func main() {
 	// account as its node owner (so discovery seeds it) and resolves every
 	// user/tweet/image request live from the Fediverse via ActivityPub.
 	if nodeCli != nil {
-		nodeCli.serveRoutes(g, envOr("GATEWAY_OWNER_HANDLE", defaultOwnerHandle))
+		nodeCli.serveRoutes(g, defaultOwnerHandle)
 	}
 
 	// Outbound federation follows the graph: when a Warpnet user gains a
@@ -176,32 +160,22 @@ func main() {
 	if nodeCli != nil {
 		of := newOutboundFederation(appCtx, nodeCli, g)
 		g.onFollowed = of.start
-		go of.runScanner(envOr("GATEWAY_OWNER_HANDLE", defaultOwnerHandle))
+		go of.runScanner(defaultOwnerHandle)
 	}
 
 	srv := &http.Server{
 		Handler:           g.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	if ts == nil {
-		srv.Addr = addr
-	}
 
 	go func() {
 		log.Infof("gateway: serving Warpnet users at https://%s/users/{id}", host)
-		if ts != nil {
-			ln, lerr := ts.ListenFunnel("tcp", ":443")
-			if lerr != nil {
-				log.Fatalf("gateway: tailscale funnel: %v", lerr)
-			}
-			log.Infof("gateway: serving public https://%s via Tailscale Funnel", host)
-			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Fatalf("gateway: serve: %v", err)
-			}
-			return
+		ln, lerr := ts.ListenFunnel("tcp", ":443")
+		if lerr != nil {
+			log.Fatalf("gateway: tailscale funnel: %v", lerr)
 		}
-		log.Infof("gateway: listening on %s, public https://%s", addr, host)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Infof("gateway: serving public https://%s via Tailscale Funnel", host)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("gateway: serve: %v", err)
 		}
 	}()
@@ -218,9 +192,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
-	if ts != nil {
-		_ = ts.Close()
-	}
+	_ = ts.Close()
 }
 
 func envOr(key, def string) string {

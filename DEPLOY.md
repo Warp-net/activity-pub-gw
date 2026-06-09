@@ -57,13 +57,9 @@ copy the `tskey-auth-...` value — it becomes `TS_AUTHKEY`.
 The gateway joins Warpnet by itself and serves **any** user, so none of these
 are required:
 
-| Variable            | When to set it                                               | Default     |
-| ------------------- | ----------------------------------------------------------- | ----------- |
-| `NODE_NETWORK`      | only for a non-default network                              | `warpnet`   |
-| `GATEWAY_NODE_ADDR` | to add an explicit entry peer instead of the bootstrap nodes | (bootstrap) |
-
-> If you do set `GATEWAY_NODE_ADDR`, note that inside a container `127.0.0.1` is
-> the container, not the host — use the node's **LAN IP** or `--network host`.
+| Variable       | When to set it                 | Default   |
+| -------------- | ------------------------------ | --------- |
+| `NODE_NETWORK` | only for a non-default network | `warpnet` |
 
 ---
 
@@ -85,11 +81,11 @@ docker run -d --name warpnet-gw -v warpnet-gw-data:/data \
 ```
 
 The gateway joins Warpnet through the network's bootstrap nodes on its own — no
-`GATEWAY_NODE_ADDR` or `NODE_NETWORK` needed (add them only per the table in B).
+`NODE_NETWORK` needed (add it only per the table in B).
 
-- With no `GATEWAY_HOST` (the default) the gateway self-hosts via Funnel — you do
-  **not** publish any ports; inbound traffic arrives through Tailscale, so the
-  container needs only outbound internet.
+- The gateway self-hosts via Funnel — you do **not** publish any ports; inbound
+  traffic arrives through Tailscale, so the container needs only outbound
+  internet.
 - The `/data` volume holds the RSA key, the follower fallback, and the Tailscale
   node identity, so the `*.ts.net` hostname stays stable across restarts.
 
@@ -130,7 +126,7 @@ pending). The gateway logs `inbox: Follow from …` and `accept: Follow accepted
 | ------------------------------------------------ | --------------------------------------------------------------------------- |
 | Funnel-access error on startup                   | A2 (HTTPS) or A3 (funnel in ACL) not done                                   |
 | a login URL is printed and startup hangs         | `TS_AUTHKEY` empty/expired → regenerate (A4)                                |
-| `serving the static profile only` in logs        | couldn't reach Warpnet bootstrap → check outbound internet, or set `GATEWAY_NODE_ADDR` (LAN IP / `--network host`) |
+| `serving the static profile only` in logs        | couldn't reach Warpnet bootstrap → check outbound internet                  |
 | handle doesn't resolve from Mastodon             | Funnel isn't public (check the D1 Funnel line) or you searched the wrong host |
 | `signature verification failed` on inbound       | host clock drift → sync NTP                                                 |
 
@@ -140,8 +136,8 @@ pending). The gateway logs `inbox: Follow from …` and `accept: Follow accepted
 
 If the gateway can't reach any Warpnet bootstrap peer, it logs `serving the
 static profile only` and serves an empty source — no users resolve until it can
-join. Check the container's outbound internet (or set `GATEWAY_NODE_ADDR`).
-Normally it joins automatically and serves any user.
+join. Check the container's outbound internet. Normally it joins automatically
+and serves any user.
 
 ## Without Docker
 

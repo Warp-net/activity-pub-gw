@@ -51,17 +51,18 @@ import (
 
 const defaultWarpnetNetwork = "warpnet"
 
-// defaultGatewaySeed derives the gateway's stable libp2p identity (override with
-// GATEWAY_SEED). defaultP2PListen is its libp2p listen address (override with
-// GATEWAY_P2P_LISTEN; set GATEWAY_P2P_ANNOUNCE to the public multiaddr).
+// defaultGatewaySeed derives the gateway's stable libp2p identity (warpnet pins
+// the resulting peer id as mastodon.GatewayNodeID, so it is not configurable).
+// defaultP2PListen is its libp2p listen address (relay-only, never advertised).
 const (
 	defaultGatewaySeed = "warpnet-activitypub-gateway"
 	defaultP2PListen   = "/ip4/0.0.0.0/tcp/4040"
 )
 
 // defaultOwnerHandle is the Mastodon account the gateway advertises as its node
-// owner (override with GATEWAY_OWNER_HANDLE) so Warpnet discovery seeds it as
-// the entry point into the Fediverse. The gateway has no Warpnet user of its own.
+// owner (warpnet pins it as mastodon.EntryHandle, so it is not configurable) so
+// Warpnet discovery seeds it as the entry point into the Fediverse. The gateway
+// has no Warpnet user of its own.
 const defaultOwnerHandle = "warpnet@mastodon.social"
 
 // bootstrapByNetwork lists the public entry nodes per network (the network's
