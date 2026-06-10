@@ -311,7 +311,7 @@ func TestTweetPollerSeedAndDedup(t *testing.T) {
 
 	// seed marks existing tweets as seen (no history replay)
 	for _, tw := range p.fetch() {
-		p.seen[tw.Id] = struct{}{}
+		p.seen.Add(tw.Id, struct{}{})
 	}
 
 	// a new tweet arrives → published once
