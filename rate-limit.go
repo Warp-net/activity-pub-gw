@@ -77,15 +77,25 @@ const (
 // rateLimiters is the gateway's request throttle: one global limiter plus
 // per-client-IP limiters held in an expirable LRU (evicted limiters are closed).
 type rateLimiters struct {
-	global *ratelimiter.Limiter
+	window       time.Duration
+	clientBudget uint32
+	global       *ratelimiter.Limiter
 
 	mu      sync.Mutex // serializes get-or-create on clients
 	clients *expirable.LRU[string, *ratelimiter.Limiter]
 }
 
 func newRateLimiters() *rateLimiters {
+	return newRateLimitersWith(globalBudget, perClientBudget, rateWindow)
+}
+
+// newRateLimitersWith parameterizes the budgets/window so tests can exercise
+// the middleware without spending 120 requests per case.
+func newRateLimitersWith(global, perClient uint32, window time.Duration) *rateLimiters {
 	return &rateLimiters{
-		global: ratelimiter.NewLimiter(globalBudget, rateWindow, nil),
+		window:       window,
+		clientBudget: perClient,
+		global:       ratelimiter.NewLimiter(global, window, nil),
 		clients: expirable.NewLRU(maxClientLimiters,
 			func(_ string, l *ratelimiter.Limiter) { l.Close() },
 			clientLimiterTTL),
@@ -96,9 +106,13 @@ func (rl *rateLimiters) client(ip string) *ratelimiter.Limiter {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	if l, ok := rl.clients.Get(ip); ok {
+		// Get doesn't extend the entry's TTL; re-Add so eviction hits idle
+		// clients only — an active client must not get a fresh budget every
+		// clientLimiterTTL.
+		rl.clients.Add(ip, l)
 		return l
 	}
-	l := ratelimiter.NewLimiter(perClientBudget, rateWindow, nil)
+	l := ratelimiter.NewLimiter(rl.clientBudget, rl.window, nil)
 	rl.clients.Add(ip, l)
 	return l
 }
@@ -111,7 +125,7 @@ func (rl *rateLimiters) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lim := rl.client(clientIP(r))
 		if rl.global.IsLocked() || lim.IsLocked() {
-			w.Header().Set("Retry-After", strconv.Itoa(int(rateWindow/time.Second)))
+			w.Header().Set("Retry-After", strconv.Itoa(int(rl.window/time.Second)))
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}

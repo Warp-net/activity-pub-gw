@@ -329,6 +329,72 @@ func TestTweetPollerSeedAndDedup(t *testing.T) {
 	}
 }
 
+func TestRateLimitMiddleware(t *testing.T) {
+	rl := newRateLimitersWith(1000, 8, time.Second)
+	var served int
+	h := rl.middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		served++
+		w.WriteHeader(http.StatusOK)
+	}))
+	do := func(path, addr string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r.RemoteAddr = addr
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+
+	// weight-1 requests pass until the 8-unit budget is spent
+	for i := 0; i < 8; i++ {
+		if w := do("/nodeinfo/2.0", "203.0.113.1:1000"); w.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200", i+1, w.Code)
+		}
+	}
+	w := do("/nodeinfo/2.0", "203.0.113.1:1000")
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("over budget: status = %d, want 429", w.Code)
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Fatal("over budget: missing Retry-After header")
+	}
+	if served != 8 {
+		t.Fatalf("served = %d, want 8", served)
+	}
+
+	// another client IP has its own budget
+	if w := do("/nodeinfo/2.0", "203.0.113.2:1000"); w.Code != http.StatusOK {
+		t.Fatalf("other client: status = %d, want 200", w.Code)
+	}
+
+	// a weight-8 media request exhausts a fresh client's budget in one hit
+	if w := do(pathMedia+"x", "203.0.113.3:1000"); w.Code != http.StatusOK {
+		t.Fatalf("media: status = %d, want 200", w.Code)
+	}
+	if w := do("/nodeinfo/2.0", "203.0.113.3:1000"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("media client over budget: status = %d, want 429", w.Code)
+	}
+}
+
+func TestRequestWeight(t *testing.T) {
+	cases := map[string]uint32{
+		"/nodeinfo/2.0":              weightStatic,
+		"/.well-known/nodeinfo":      weightStatic,
+		"/.well-known/webfinger?r=x": weightActor,
+		"/users/alice":               weightActor,
+		"/users/alice/outbox":        weightCollection,
+		"/users/alice/statuses/1":    weightCollection,
+		"/users/alice/inbox":         weightInbox,
+		"/inbox":                     weightInbox,
+		"/media/abc":                 weightMedia,
+	}
+	for path, want := range cases {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		if got := requestWeight(r); got != want {
+			t.Errorf("requestWeight(%s) = %d, want %d", path, got, want)
+		}
+	}
+}
+
 func TestTranslateInbound(t *testing.T) {
 	g := testGateway(t) // host gw.example
 	actor := "https://m/users/bob"
