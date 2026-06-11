@@ -79,12 +79,14 @@ func (g *gateway) handleMedia(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// File is "<mime>,<base64>" (see domain image keys).
+	// File is a data URL ("data:<mime>;base64,<data>" — the node stores images
+	// that way); tolerate the bare "<mime>,<base64>" form too.
 	mime, data, found := strings.Cut(resp.File, ",")
 	if !found {
 		http.NotFound(w, r)
 		return
 	}
+	mime = strings.TrimSuffix(strings.TrimPrefix(mime, "data:"), ";base64")
 	bytes, derr := base64.StdEncoding.DecodeString(data)
 	if derr != nil {
 		log.Errorf("media: decode %s/%s: %v", userID, key, derr)

@@ -39,6 +39,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Warp-net/warpnet/domain"
@@ -101,9 +102,19 @@ func (b *mastodonBridge) GetUser(ctx context.Context, handle string) (user, erro
 		return user{}, err
 	}
 	u := actorToUser(handle, actorURL, m, b.nodeID)
-	u.FollowersCount = b.collectionCount(ctx, asString(m["followers"]))
-	u.FollowingsCount = b.collectionCount(ctx, asString(m["following"]))
-	u.TweetsCount = b.collectionCount(ctx, asString(m["outbox"]))
+	// The three collection fetches run in parallel so one slow endpoint does
+	// not eat the whole nodeserver request budget.
+	counts := make([]int64, 3)
+	var wg sync.WaitGroup
+	for i, coll := range []string{asString(m["followers"]), asString(m["following"]), asString(m["outbox"])} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			counts[i] = b.collectionCount(ctx, coll)
+		}()
+	}
+	wg.Wait()
+	u.FollowersCount, u.FollowingsCount, u.TweetsCount = counts[0], counts[1], counts[2]
 	return u, nil
 }
 
