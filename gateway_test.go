@@ -574,27 +574,35 @@ func TestFollowPollerDiff(t *testing.T) {
 }
 
 func TestHandleMedia(t *testing.T) {
-	g := testGateway(t)
 	raw := []byte{0x89, 'P', 'N', 'G'}
-	g.req = &fakeRequester{imageFile: "image/png," + base64.StdEncoding.EncodeToString(raw)}
+	b64 := base64.StdEncoding.EncodeToString(raw)
+	for name, file := range map[string]string{
+		"data url": "data:image/png;base64," + b64,
+		"legacy":   "image/png," + b64,
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := testGateway(t)
+			g.req = &fakeRequester{imageFile: file}
 
-	srv := httptest.NewServer(g.routes())
-	defer srv.Close()
+			srv := httptest.NewServer(g.routes())
+			defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/media/" + encodeMediaRef("alice", "img1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", resp.StatusCode)
-	}
-	if ct := resp.Header.Get("Content-Type"); ct != "image/png" {
-		t.Fatalf("content-type = %q", ct)
-	}
-	got, _ := io.ReadAll(resp.Body)
-	if !bytes.Equal(got, raw) {
-		t.Fatalf("body mismatch: %v", got)
+			resp, err := http.Get(srv.URL + "/media/" + encodeMediaRef("alice", "img1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d", resp.StatusCode)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "image/png" {
+				t.Fatalf("content-type = %q", ct)
+			}
+			got, _ := io.ReadAll(resp.Body)
+			if !bytes.Equal(got, raw) {
+				t.Fatalf("body mismatch: %v", got)
+			}
+		})
 	}
 }
 
