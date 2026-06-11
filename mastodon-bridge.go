@@ -100,7 +100,24 @@ func (b *mastodonBridge) GetUser(ctx context.Context, handle string) (user, erro
 	if err != nil {
 		return user{}, err
 	}
-	return actorToUser(handle, actorURL, m, b.nodeID), nil
+	u := actorToUser(handle, actorURL, m, b.nodeID)
+	u.FollowersCount = b.collectionCount(ctx, asString(m["followers"]))
+	u.FollowingsCount = b.collectionCount(ctx, asString(m["following"]))
+	u.TweetsCount = b.collectionCount(ctx, asString(m["outbox"]))
+	return u, nil
+}
+
+// collectionCount reads totalItems off an AP collection URL (followers,
+// following, outbox); 0 on any miss.
+func (b *mastodonBridge) collectionCount(ctx context.Context, collURL string) int64 {
+	if collURL == "" {
+		return 0
+	}
+	m, err := b.ap.apGetJSON(ctx, collURL, contentTypeAP)
+	if err != nil {
+		return 0
+	}
+	return int64(apCollectionCount(m)) //nolint:gosec
 }
 
 // GetTweets renders a remote actor's outbox as Warpnet tweets. cursor, when set,
@@ -308,7 +325,9 @@ func (b *mastodonBridge) GetImage(ctx context.Context, rawURL string) (getImageR
 	if mime == "" {
 		mime = "image/jpeg"
 	}
-	return getImageResponse{File: mime + "," + base64.StdEncoding.EncodeToString(data)}, nil
+	// Warpnet stores and serves images as full data URLs (the frontend puts the
+	// value straight into <img src>), so mirror that format on the wire.
+	return getImageResponse{File: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)}, nil
 }
 
 // --- writes (Warpnet -> Mastodon) ---
