@@ -6,8 +6,10 @@ require (
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/Warp-net/libp2p-camouflage-transport v0.0.0-20260426205729-375252339458
 	github.com/Warp-net/warpnet v1.0.1-0.20260607113234-abb969362e57
+	github.com/filinvadim/ratelimiter v0.0.0-20250304112346-2ef3a2bd6f00
 	github.com/google/uuid v1.6.0
 	github.com/grokify/html-strip-tags-go v0.1.0
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/sirupsen/logrus v1.9.4
 	github.com/superseriousbusiness/httpsig v1.2.0-SSB
@@ -27,7 +29,6 @@ require (
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/hashicorp/golang-lru/arc/v2 v2.0.7 // indirect
-	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/ipfs/bbloom v0.0.4 // indirect
 	github.com/ipfs/boxo v0.37.0 // indirect
 	github.com/ipfs/go-block-format v0.2.3 // indirect

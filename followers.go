@@ -33,6 +33,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
 // followerStore records, per local (bridged) user, the remote Fediverse actors
@@ -72,31 +75,40 @@ func decodeActorID(id string) (string, error) {
 	return string(bt), nil
 }
 
+// memFollowerStore bounds: dev-only data, so size/TTL eviction losing a
+// follower list is acceptable — production keeps the graph in Warpnet.
+const (
+	memFollowerSize = 1024
+	memFollowerTTL  = 24 * time.Hour
+)
+
 // memFollowerStore is an in-memory dev fallback used only when the gateway has
-// no Warpnet node connection. Nothing touches the disk (see CLAUDE.md).
+// no Warpnet node connection. Nothing touches the disk (see CLAUDE.md); the
+// expirable LRU keeps it bounded. The mutex makes Add's read-modify-write atomic.
 type memFollowerStore struct {
-	mu   sync.RWMutex
-	data map[string][]string // localUser -> actor URLs
+	mu   sync.Mutex
+	data *expirable.LRU[string, []string] // localUser -> actor URLs
 }
 
 func newMemFollowerStore() *memFollowerStore {
-	return &memFollowerStore{data: map[string][]string{}}
+	return &memFollowerStore{data: expirable.NewLRU[string, []string](memFollowerSize, nil, memFollowerTTL)}
 }
 
 func (s *memFollowerStore) Add(localUser, actorURL string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if slices.Contains(s.data[localUser], actorURL) {
+	urls, _ := s.data.Get(localUser)
+	if slices.Contains(urls, actorURL) {
 		return nil
 	}
-	s.data[localUser] = append(s.data[localUser], actorURL)
+	s.data.Add(localUser, append(urls, actorURL))
 	return nil
 }
 
 func (s *memFollowerStore) List(localUser string) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	src := s.data[localUser]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	src, _ := s.data.Get(localUser)
 	out := make([]string, len(src))
 	copy(out, src)
 	return out, nil

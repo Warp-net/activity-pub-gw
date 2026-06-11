@@ -95,6 +95,7 @@ type gateway struct {
 	followers   followerStore
 	req         nodeRequester          // connector to the owner's node; nil in dev/no-node mode
 	onFollowed  func(localUser string) // starts outbound federation for a user; nil without a node
+	limits      *rateLimiters          // weighted per-IP + global rate limiting; built lazily by routes()
 
 	// allowPrivateTargets disables the SSRF guard's loopback/private-range
 	// rejection for outbound delivery. Test-only; never set in main.go.
@@ -114,7 +115,10 @@ func (g *gateway) routes() http.Handler {
 	mux.HandleFunc(pathInbox, g.handleSharedInbox)
 	mux.HandleFunc(pathMedia, g.handleMedia)
 	mux.HandleFunc(pathStatic, g.handleStatic)
-	return logRequests(mux)
+	if g.limits == nil {
+		g.limits = newRateLimiters()
+	}
+	return logRequests(g.limits.middleware(mux))
 }
 
 // logRequests logs every inbound request (method, path, status, user-agent) so

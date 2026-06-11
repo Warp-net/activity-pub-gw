@@ -32,23 +32,30 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	log "github.com/sirupsen/logrus"
 )
 
-const tweetPollInterval = 60 * time.Second
+const (
+	tweetPollInterval = 60 * time.Second
+
+	// seen-set bounds: ids still present in the fetched page get their TTL
+	// refreshed on every poll, so only tweets long gone from the feed expire —
+	// expiry can't cause a re-publish.
+	tweetSeenSize = 8192
+	tweetSeenTTL  = 24 * time.Hour
+)
 
 // tweetPoller watches the bridged owner's Warpnet tweets and federates new
 // original top-level posts to Fediverse followers via publish. It is stateless
 // across restarts: at startup it marks existing tweets as seen, so only posts
 // created afterwards are federated (no replaying history on every restart).
-//
-// TODO: the seen set grows unbounded; bound it (or track a cursor/timestamp)
-// once volume warrants. Subscribing to the owner's gossip would replace polling.
+// The seen set is a bounded expirable LRU, never unbounded growth.
 type tweetPoller struct {
 	req      nodeRequester
 	owner    string
 	interval time.Duration
-	seen     map[string]struct{}
+	seen     *expirable.LRU[string, struct{}]
 	publish  func(ctx context.Context, owner string, t tweet)
 }
 
@@ -57,7 +64,7 @@ func newTweetPoller(req nodeRequester, owner string, publish func(context.Contex
 		req:      req,
 		owner:    owner,
 		interval: tweetPollInterval,
-		seen:     map[string]struct{}{},
+		seen:     expirable.NewLRU[string, struct{}](tweetSeenSize, nil, tweetSeenTTL),
 		publish:  publish,
 	}
 }
@@ -65,7 +72,7 @@ func newTweetPoller(req nodeRequester, owner string, publish func(context.Contex
 func (p *tweetPoller) run(ctx context.Context) {
 	seed := p.fetch() // seed: don't replay history
 	for _, t := range seed {
-		p.seen[t.Id] = struct{}{}
+		p.seen.Add(t.Id, struct{}{})
 	}
 	log.Infof("poller: started for %s (seeded %d existing tweets)", p.owner, len(seed))
 	ticker := time.NewTicker(p.interval)
@@ -84,10 +91,11 @@ func (p *tweetPoller) poll(ctx context.Context) {
 	tweets := p.fetch()
 	newCount, pubCount := 0, 0
 	for _, t := range tweets {
-		if _, ok := p.seen[t.Id]; ok {
+		if p.seen.Contains(t.Id) {
+			p.seen.Add(t.Id, struct{}{}) // refresh TTL while the id is still in the feed
 			continue
 		}
-		p.seen[t.Id] = struct{}{}
+		p.seen.Add(t.Id, struct{}{})
 		newCount++
 		if publishableTweet(t, p.owner) {
 			pubCount++

@@ -39,6 +39,7 @@ import (
 	"github.com/Masterminds/semver/v3"
 	camouflage "github.com/Warp-net/libp2p-camouflage-transport"
 	"github.com/Warp-net/warpnet/security"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	p2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -56,6 +57,13 @@ var (
 	errNoEntryReachable = errors.New("nodeclient: no Warpnet entry peer reachable")
 )
 
+// owner cache bounds: ownership can move between nodes, so entries expire and
+// re-resolve via GET_USER; a miss costs one broadcast request.
+const (
+	ownerCacheSize = 1024
+	ownerCacheTTL  = 10 * time.Minute
+)
+
 // nodeClient joins the Warpnet DHT through the network's relays and streams the
 // /public/... routes to the member nodes it discovers via the DHT.
 type nodeClient struct {
@@ -65,8 +73,8 @@ type nodeClient struct {
 	relays map[peer.ID]struct{} // entry peers (relays): discovery/connectivity only, not data routes
 
 	mu    sync.Mutex
-	good  []peer.ID          // member nodes known to answer data routes; tried first
-	owner map[string]peer.ID // userID -> its home node (domain.User.NodeId); user-scoped routes target it
+	good  []peer.ID                       // member nodes known to answer data routes; tried first
+	owner *expirable.LRU[string, peer.ID] // userID -> its home node (domain.User.NodeId); user-scoped routes target it
 }
 
 // networkEntries are the network's bootstrap relays (the DHT entry points).
@@ -189,7 +197,10 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 	}
 	log.Infof("nodeclient %v: joined Warpnet (%s) via %d relay(s); discovering members via DHT", h.ID(), network, connected)
 
-	return &nodeClient{h: h, priv: priv, dht: kdht, relays: relays, owner: map[string]peer.ID{}}, nil
+	return &nodeClient{
+		h: h, priv: priv, dht: kdht, relays: relays,
+		owner: expirable.NewLRU[string, peer.ID](ownerCacheSize, nil, ownerCacheTTL),
+	}, nil
 }
 
 // request streams the route to the member nodes discovered via the DHT, trying
@@ -249,10 +260,7 @@ func (c *nodeClient) requestUser(userID, route string, payload any) ([]byte, err
 // carries is the user's authoritative node regardless of who replied) and
 // caches it.
 func (c *nodeClient) ownerNode(userID string) (peer.ID, bool) {
-	c.mu.Lock()
-	p, ok := c.owner[userID]
-	c.mu.Unlock()
-	if ok {
+	if p, ok := c.owner.Get(userID); ok {
 		return p, true
 	}
 
@@ -264,14 +272,12 @@ func (c *nodeClient) ownerNode(userID string) (peer.ID, bool) {
 	if json.Unmarshal(bt, &u) != nil || u.NodeId == "" {
 		return "", false
 	}
-	p, err = peer.Decode(u.NodeId)
+	p, err := peer.Decode(u.NodeId)
 	if err != nil {
 		log.Warnf("nodeclient: bad node_id %q for %s: %v", u.NodeId, userID, err)
 		return "", false
 	}
-	c.mu.Lock()
-	c.owner[userID] = p
-	c.mu.Unlock()
+	c.owner.Add(userID, p)
 	log.Infof("nodeclient: owner of %s resolved to node %s; user-scoped routes target it directly", userID, p)
 	return p, true
 }
@@ -279,9 +285,7 @@ func (c *nodeClient) ownerNode(userID string) (peer.ID, bool) {
 // forgetOwner drops a cached owner mapping so the next user-scoped request
 // re-resolves it (e.g. after the owner node moved or went briefly unreachable).
 func (c *nodeClient) forgetOwner(userID string) {
-	c.mu.Lock()
-	delete(c.owner, userID)
-	c.mu.Unlock()
+	c.owner.Remove(userID)
 }
 
 func (c *nodeClient) close() {
