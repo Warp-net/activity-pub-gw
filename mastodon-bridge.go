@@ -39,6 +39,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Warp-net/warpnet/domain"
@@ -100,7 +101,34 @@ func (b *mastodonBridge) GetUser(ctx context.Context, handle string) (user, erro
 	if err != nil {
 		return user{}, err
 	}
-	return actorToUser(handle, actorURL, m, b.nodeID), nil
+	u := actorToUser(handle, actorURL, m, b.nodeID)
+	// The three collection fetches run in parallel so one slow endpoint does
+	// not eat the whole nodeserver request budget.
+	counts := make([]int64, 3)
+	var wg sync.WaitGroup
+	for i, coll := range []string{asString(m["followers"]), asString(m["following"]), asString(m["outbox"])} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			counts[i] = b.collectionCount(ctx, coll)
+		}()
+	}
+	wg.Wait()
+	u.FollowersCount, u.FollowingsCount, u.TweetsCount = counts[0], counts[1], counts[2]
+	return u, nil
+}
+
+// collectionCount reads totalItems off an AP collection URL (followers,
+// following, outbox); 0 on any miss.
+func (b *mastodonBridge) collectionCount(ctx context.Context, collURL string) int64 {
+	if collURL == "" {
+		return 0
+	}
+	m, err := b.ap.apGetJSON(ctx, collURL, contentTypeAP)
+	if err != nil {
+		return 0
+	}
+	return int64(apCollectionCount(m)) //nolint:gosec
 }
 
 // GetTweets renders a remote actor's outbox as Warpnet tweets. cursor, when set,
@@ -308,7 +336,9 @@ func (b *mastodonBridge) GetImage(ctx context.Context, rawURL string) (getImageR
 	if mime == "" {
 		mime = "image/jpeg"
 	}
-	return getImageResponse{File: mime + "," + base64.StdEncoding.EncodeToString(data)}, nil
+	// Warpnet stores and serves images as full data URLs (the frontend puts the
+	// value straight into <img src>), so mirror that format on the wire.
+	return getImageResponse{File: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)}, nil
 }
 
 // --- writes (Warpnet -> Mastodon) ---
