@@ -576,7 +576,10 @@ func (g *gateway) sendRetry(ctx context.Context, newReq func() (*http.Request, e
 		}
 		defer func() { _ = resp.Body.Close() }()
 		status, header = resp.StatusCode, resp.Header
-		body, _ = io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+		body, rerr = io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+		if rerr != nil {
+			return rerr // truncated/transient read: retry
+		}
 		if status >= 300 && retryableStatus(status) {
 			return fmt.Errorf("status %d: %w", status, errRemoteStatus)
 		}
@@ -737,17 +740,21 @@ func (g *gateway) postSigned(ctx context.Context, localUser, target string, doc 
 		req.Header.Set(headerContentType, contentTypeAP)
 		return req, signRequest(req, g.keyID(localUser), g.key, body)
 	})
+	// Include a snippet of the peer's response: Mastodon explains inbox
+	// rejections in the body (e.g. signature/verification, blocked domain),
+	// which is what we need to diagnose a failed delivery — keep it even when
+	// retries were exhausted on a 429/5xx (err != nil but a body was read).
+	snippet := strings.TrimSpace(string(respBody))
+	if len(snippet) > 300 {
+		snippet = snippet[:300]
+	}
 	if err != nil {
+		if snippet != "" {
+			return fmt.Errorf("deliver to %s: %w: %s", target, err, snippet)
+		}
 		return fmt.Errorf("deliver to %s: %w", target, err)
 	}
 	if status >= 300 {
-		// Include a snippet of the peer's response: Mastodon explains inbox
-		// rejections in the body (e.g. signature/verification, blocked domain),
-		// which is what we need to diagnose a failed delivery.
-		snippet := strings.TrimSpace(string(respBody))
-		if len(snippet) > 300 {
-			snippet = snippet[:300]
-		}
 		return fmt.Errorf("deliver to %s: status %d: %w: %s", target, status, errRemoteStatus, snippet)
 	}
 	return nil

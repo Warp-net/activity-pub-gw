@@ -13,8 +13,11 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Warp-net/warpnet/retrier"
 )
 
 func testGateway(t *testing.T) *gateway {
@@ -674,4 +677,61 @@ func TestValidateRemoteURL(t *testing.T) {
 			t.Errorf("expected error for %s", u)
 		}
 	}
+}
+
+func TestSendRetry(t *testing.T) {
+	g := testGateway(t)
+	g.retrier = retrier.New(time.Millisecond, 3, retrier.NoBackoff)
+
+	t.Run("4xx is not retried", func(t *testing.T) {
+		var n int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			atomic.AddInt32(&n, 1)
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer srv.Close()
+		if _, err := g.apGetJSON(context.Background(), srv.URL, contentTypeAP); err == nil {
+			t.Fatal("want error")
+		}
+		if got := atomic.LoadInt32(&n); got != 1 {
+			t.Fatalf("attempts = %d, want 1", got)
+		}
+	})
+
+	t.Run("5xx retries then exhausts", func(t *testing.T) {
+		var n int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			atomic.AddInt32(&n, 1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer srv.Close()
+		if _, err := g.apGetJSON(context.Background(), srv.URL, contentTypeAP); err == nil {
+			t.Fatal("want error")
+		}
+		if got := atomic.LoadInt32(&n); got != 3 {
+			t.Fatalf("attempts = %d, want 3", got)
+		}
+	})
+
+	t.Run("succeeds after a transient 503", func(t *testing.T) {
+		var n int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if atomic.AddInt32(&n, 1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer srv.Close()
+		m, err := g.apGetJSON(context.Background(), srv.URL, contentTypeAP)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if m["ok"] != true {
+			t.Fatalf("body = %v", m)
+		}
+		if got := atomic.LoadInt32(&n); got != 2 {
+			t.Fatalf("attempts = %d, want 2", got)
+		}
+	})
 }
