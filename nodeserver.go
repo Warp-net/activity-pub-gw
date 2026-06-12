@@ -106,11 +106,11 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 		},
 
 		routePostLike: wrapJSON(func(ctx context.Context, ev likeEvent) (any, error) {
-			count, err := b.Like(ctx, string(ev.UserId), string(ev.TweetId), false)
+			count, err := b.Like(ctx, string(ev.OwnerId), string(ev.TweetId), false)
 			return event.LikesCountResponse{Count: count}, err
 		}),
 		routePostUnlike: wrapJSON(func(ctx context.Context, ev likeEvent) (any, error) {
-			count, err := b.Like(ctx, string(ev.UserId), string(ev.TweetId), true)
+			count, err := b.Like(ctx, string(ev.OwnerId), string(ev.TweetId), true)
 			return event.LikesCountResponse{Count: count}, err
 		}),
 		routePostFollow: wrapJSON(func(ctx context.Context, ev newFollowEvent) (any, error) {
