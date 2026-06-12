@@ -720,9 +720,16 @@ func (g *gateway) postSigned(ctx context.Context, localUser, target string, doc 
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("deliver to %s: status %d: %w", target, resp.StatusCode, errRemoteStatus)
+		// Include a snippet of the peer's response: Mastodon explains inbox
+		// rejections in the body (e.g. signature/verification, blocked domain),
+		// which is what we need to diagnose a failed delivery.
+		snippet := strings.TrimSpace(string(respBody))
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		return fmt.Errorf("deliver to %s: status %d: %w: %s", target, resp.StatusCode, errRemoteStatus, snippet)
 	}
 	return nil
 }
