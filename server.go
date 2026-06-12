@@ -129,6 +129,7 @@ func (g *gateway) routes() http.Handler {
 	mux.HandleFunc("/nodeinfo/2.0", g.handleNodeInfo)
 	mux.HandleFunc(pathUsers, g.handleUsers)
 	mux.HandleFunc(pathActor, g.handleInstanceActor)
+	mux.HandleFunc(pathActor+"/", g.handleInstanceActorSub)
 	mux.HandleFunc(pathInbox, g.handleSharedInbox)
 	mux.HandleFunc(pathMedia, g.handleMedia)
 	mux.HandleFunc(pathStatic, g.handleStatic)
@@ -247,6 +248,17 @@ func (g *gateway) handleInstanceActor(w http.ResponseWriter, _ *http.Request) {
 		},
 		Endpoints: &actorEndpoints{SharedInbox: g.baseURL() + pathInbox},
 	})
+}
+
+// handleInstanceActorSub serves the instance actor's advertised collections as
+// empty (it federates nothing of its own); anything else under /actor/ is 404.
+func (g *gateway) handleInstanceActorSub(w http.ResponseWriter, r *http.Request) {
+	switch strings.TrimPrefix(r.URL.Path, pathActor+"/") {
+	case "outbox", "followers", "following":
+		g.serveEmptyCollection(w, g.baseURL()+r.URL.Path)
+	default:
+		http.NotFound(w, r)
+	}
 }
 
 // buildActor renders the actor document. Shared by serveActor (served on GET)

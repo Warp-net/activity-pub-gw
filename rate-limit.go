@@ -163,7 +163,9 @@ func isControlPlane(p string) bool {
 		if i < 0 {
 			return true // actor document /users/{id}
 		}
-		return strings.HasPrefix(rest[i+1:], "inbox") // /users/{id}/inbox
+		sub := rest[i+1:]
+		// /users/{id}/ (trailing slash) is also served as the actor document.
+		return sub == "" || strings.HasPrefix(sub, "inbox")
 	}
 	return false
 }
