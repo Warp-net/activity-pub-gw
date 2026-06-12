@@ -58,11 +58,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Warp-net/warpnet/retrier"
 	log "github.com/sirupsen/logrus"
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.43"
+const gatewayVersion = "0.1.44"
 
 const fatalFmt = "gateway: %v"
 
@@ -141,6 +142,9 @@ func main() {
 		sem:       make(chan struct{}, maxInflightDeliveries),
 		followers: followers,
 		req:       req,
+		// Retry transient Mastodon HTTP failures (network errors, 429, 5xx) a few
+		// times with exponential backoff; bounded so it stays within the request budget.
+		retrier: retrier.New(300*time.Millisecond, 3, retrier.ExponentialBackoff),
 	}
 
 	// Serve Warpnet's public /public routes over libp2p (Mastodon -> Warpnet):

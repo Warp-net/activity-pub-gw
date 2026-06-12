@@ -45,6 +45,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Warp-net/warpnet/retrier"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -91,7 +92,8 @@ type gateway struct {
 	keyPubPEM  string
 	source     warpnetSource
 	client     *http.Client
-	sem        chan struct{} // bounds concurrent Accept deliveries
+	retrier    retrier.Retrier // retries transient Mastodon HTTP failures; nil = single attempt
+	sem        chan struct{}   // bounds concurrent Accept deliveries
 	followers  followerStore
 	req        nodeRequester          // connector to the owner's node; nil in dev/no-node mode
 	onFollowed func(localUser string) // starts outbound federation for a user; nil without a node
@@ -550,6 +552,42 @@ func newSafeClient(timeout time.Duration) *http.Client {
 
 // fetchActor dereferences a remote actor document, signing the GET so it
 // works against instances running in authorized-fetch / secure mode.
+// retryableStatus reports whether an HTTP status warrants a retry: 429 and 5xx
+// are transient (peer overloaded / temporarily unavailable); 4xx are not.
+func retryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
+}
+
+// sendRetry issues the request built by newReq and reads its response, retrying
+// transient failures (network errors, 429, 5xx) via the gateway retrier.
+// newReq must build a fresh request each call (the body is consumed per
+// attempt). A non-retryable status returns nil error with the status/body so
+// the caller can render its own message; an exhausted/transport error is
+// returned as err.
+func (g *gateway) sendRetry(ctx context.Context, newReq func() (*http.Request, error)) (status int, body []byte, header http.Header, err error) {
+	do := func() error {
+		req, rerr := newReq()
+		if rerr != nil {
+			return fmt.Errorf("%w: %w", rerr, retrier.ErrStopTrying)
+		}
+		resp, rerr := g.client.Do(req) //nolint:gosec // SSRF-guarded by validateRemoteURL + safe client
+		if rerr != nil {
+			return rerr // network error: retry
+		}
+		defer func() { _ = resp.Body.Close() }()
+		status, header = resp.StatusCode, resp.Header
+		body, _ = io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+		if status >= 300 && retryableStatus(status) {
+			return fmt.Errorf("status %d: %w", status, errRemoteStatus)
+		}
+		return nil
+	}
+	if g.retrier == nil {
+		return status, body, header, do()
+	}
+	return status, body, header, g.retrier.Try(ctx, do)
+}
+
 func (g *gateway) fetchActor(ctx context.Context, actorURL string) (map[string]any, error) {
 	if !g.allowPrivateTargets {
 		if err := validateRemoteURL(actorURL); err != nil {
@@ -559,25 +597,19 @@ func (g *gateway) fetchActor(ctx context.Context, actorURL string) (map[string]a
 	// G704: dereferencing remote actor URLs is intrinsic to ActivityPub
 	// federation; validateRemoteURL enforces https, full SSRF hardening is a
 	// documented production TODO.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, actorURL, nil) //nolint:gosec // see note above
+	status, bt, _, err := g.sendRetry(ctx, func() (*http.Request, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, actorURL, nil)
+		if rerr != nil {
+			return nil, rerr
+		}
+		req.Header.Set("Accept", contentTypeAP)
+		return req, g.signGet(req)
+	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch %s: %w", actorURL, err)
 	}
-	req.Header.Set("Accept", contentTypeAP)
-	if err := g.signGet(req); err != nil {
-		return nil, err
-	}
-	resp, err := g.client.Do(req) //nolint:gosec // see G704 note above
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch %s: status %d: %w", actorURL, resp.StatusCode, errRemoteStatus)
-	}
-	bt, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
-	if err != nil {
-		return nil, err
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("fetch %s: status %d: %w", actorURL, status, errRemoteStatus)
 	}
 	var m map[string]any
 	if err := json.Unmarshal(bt, &m); err != nil {
@@ -637,25 +669,19 @@ func (g *gateway) apGetJSON(ctx context.Context, rawURL, accept string) (map[str
 			return nil, err
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil) //nolint:gosec // SSRF-guarded + safe client
+	status, bt, _, err := g.sendRetry(ctx, func() (*http.Request, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if rerr != nil {
+			return nil, rerr
+		}
+		req.Header.Set("Accept", accept)
+		return req, g.signGet(req)
+	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch %s: %w", rawURL, err)
 	}
-	req.Header.Set("Accept", accept)
-	if err := g.signGet(req); err != nil {
-		return nil, err
-	}
-	resp, err := g.client.Do(req) //nolint:gosec // see note above
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch %s: status %d: %w", rawURL, resp.StatusCode, errRemoteStatus)
-	}
-	bt, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
-	if err != nil {
-		return nil, err
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("fetch %s: status %d: %w", rawURL, status, errRemoteStatus)
 	}
 	var m map[string]any
 	if err := json.Unmarshal(bt, &m); err != nil {
@@ -672,26 +698,20 @@ func (g *gateway) fetchMedia(ctx context.Context, rawURL string) (string, []byte
 			return "", nil, err
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil) //nolint:gosec // SSRF-guarded + safe client
+	status, bt, header, err := g.sendRetry(ctx, func() (*http.Request, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if rerr != nil {
+			return nil, rerr
+		}
+		return req, g.signGet(req)
+	})
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("media %s: %w", rawURL, err)
 	}
-	if err := g.signGet(req); err != nil {
-		return "", nil, err
+	if status != http.StatusOK {
+		return "", nil, fmt.Errorf("media %s: status %d: %w", rawURL, status, errRemoteStatus)
 	}
-	resp, err := g.client.Do(req) //nolint:gosec // see note above
-	if err != nil {
-		return "", nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return "", nil, fmt.Errorf("media %s: status %d: %w", rawURL, resp.StatusCode, errRemoteStatus)
-	}
-	bt, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
-	if err != nil {
-		return "", nil, err
-	}
-	return resp.Header.Get(headerContentType), bt, nil
+	return header.Get(headerContentType), bt, nil
 }
 
 // postSigned delivers a signed POST of doc to target, as localUser.
@@ -706,22 +726,21 @@ func (g *gateway) postSigned(ctx context.Context, localUser, target string, doc 
 		return err
 	}
 	// G704: target is a federation peer inbox; validateRemoteURL (above) enforces
-	// https and newSafeClient guards redirects + the resolved dial IP.
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body)) //nolint:gosec // see note above
+	// https and newSafeClient guards redirects + the resolved dial IP. A retried
+	// delivery re-signs (fresh Date) and re-sends the same activity id, which the
+	// peer deduplicates — safe to retry on transient (429/5xx) failures.
+	status, respBody, _, err := g.sendRetry(ctx, func() (*http.Request, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+		if rerr != nil {
+			return nil, rerr
+		}
+		req.Header.Set(headerContentType, contentTypeAP)
+		return req, signRequest(req, g.keyID(localUser), g.key, body)
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("deliver to %s: %w", target, err)
 	}
-	req.Header.Set(headerContentType, contentTypeAP)
-	if err := signRequest(req, g.keyID(localUser), g.key, body); err != nil {
-		return err
-	}
-	resp, err := g.client.Do(req) //nolint:gosec // see G704 note above
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
-	if resp.StatusCode >= 300 {
+	if status >= 300 {
 		// Include a snippet of the peer's response: Mastodon explains inbox
 		// rejections in the body (e.g. signature/verification, blocked domain),
 		// which is what we need to diagnose a failed delivery.
@@ -729,7 +748,7 @@ func (g *gateway) postSigned(ctx context.Context, localUser, target string, doc 
 		if len(snippet) > 300 {
 			snippet = snippet[:300]
 		}
-		return fmt.Errorf("deliver to %s: status %d: %w: %s", target, resp.StatusCode, errRemoteStatus, snippet)
+		return fmt.Errorf("deliver to %s: status %d: %w: %s", target, status, errRemoteStatus, snippet)
 	}
 	return nil
 }
