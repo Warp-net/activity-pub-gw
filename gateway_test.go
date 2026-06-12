@@ -32,7 +32,6 @@ func testGateway(t *testing.T) *gateway {
 		key:                 key,
 		keyPubPEM:           pub,
 		source:              staticSource{user: warpnetUser{ID: "alice", PreferredUsername: "alice", DisplayName: "Alice"}},
-		signingUser:         "alice",
 		client:              http.DefaultClient,
 		sem:                 make(chan struct{}, 4),
 		followers:           newMemFollowerStore(),

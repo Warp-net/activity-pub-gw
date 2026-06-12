@@ -154,7 +154,7 @@ func (rl *rateLimiters) middleware(next http.Handler) http.Handler {
 // plane (actor document, any inbox, webfinger) that peers must always reach to
 // verify and deliver activities. Collections and media stay data-plane.
 func isControlPlane(p string) bool {
-	if p == pathInbox || strings.HasPrefix(p, "/.well-known/webfinger") {
+	if p == pathInbox || p == pathActor || strings.HasPrefix(p, "/.well-known/webfinger") {
 		return true
 	}
 	if strings.HasPrefix(p, pathUsers) {

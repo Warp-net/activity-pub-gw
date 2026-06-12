@@ -65,6 +65,7 @@ const (
 
 	pathUsers     = "/users/"
 	pathInbox     = "/inbox"
+	pathActor     = "/actor"
 	pathFollowers = "/followers"
 	pathStatuses  = "/statuses/"
 	pathMedia     = "/media/"
@@ -85,17 +86,16 @@ var (
 // key and the follower store (followers.go). Warpnet content is never stored
 // here.
 type gateway struct {
-	host        string // public hostname, e.g. name.tailnet.ts.net (no scheme)
-	key         *rsa.PrivateKey
-	keyPubPEM   string
-	source      warpnetSource
-	signingUser string // optional: user to sign authorized-fetch GETs as ("" = unsigned)
-	client      *http.Client
-	sem         chan struct{} // bounds concurrent Accept deliveries
-	followers   followerStore
-	req         nodeRequester          // connector to the owner's node; nil in dev/no-node mode
-	onFollowed  func(localUser string) // starts outbound federation for a user; nil without a node
-	limits      *rateLimiters          // weighted per-IP + global rate limiting; built lazily by routes()
+	host       string // public hostname, e.g. name.tailnet.ts.net (no scheme)
+	key        *rsa.PrivateKey
+	keyPubPEM  string
+	source     warpnetSource
+	client     *http.Client
+	sem        chan struct{} // bounds concurrent Accept deliveries
+	followers  followerStore
+	req        nodeRequester          // connector to the owner's node; nil in dev/no-node mode
+	onFollowed func(localUser string) // starts outbound federation for a user; nil without a node
+	limits     *rateLimiters          // weighted per-IP + global rate limiting; built lazily by routes()
 
 	// allowPrivateTargets disables the SSRF guard's loopback/private-range
 	// rejection for outbound delivery. Test-only; never set in main.go.
@@ -106,12 +106,29 @@ func (g *gateway) baseURL() string            { return "https://" + g.host }
 func (g *gateway) actorID(user string) string { return g.baseURL() + pathUsers + user }
 func (g *gateway) keyID(user string) string   { return g.actorID(user) + "#main-key" }
 
+// instanceActorID is the gateway's own ActivityPub actor (an Application). It
+// signs outbound authorized-fetch GETs: secure-mode peers dereference
+// instanceKeyID to fetch the gateway signing key and verify the fetch. It is
+// served from memory, independent of any Warpnet user.
+func (g *gateway) instanceActorID() string { return g.baseURL() + pathActor }
+func (g *gateway) instanceKeyID() string   { return g.instanceActorID() + "#main-key" }
+
+// signGet signs an outbound GET as the gateway instance actor so secure-mode
+// (authorized-fetch) peers answer it; a no-op when no signing key is present.
+func (g *gateway) signGet(req *http.Request) error {
+	if g.key == nil {
+		return nil
+	}
+	return signRequest(req, g.instanceKeyID(), g.key, nil)
+}
+
 func (g *gateway) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/webfinger", g.handleWebFinger)
 	mux.HandleFunc("/.well-known/nodeinfo", g.handleNodeInfoLinks)
 	mux.HandleFunc("/nodeinfo/2.0", g.handleNodeInfo)
 	mux.HandleFunc(pathUsers, g.handleUsers)
+	mux.HandleFunc(pathActor, g.handleInstanceActor)
 	mux.HandleFunc(pathInbox, g.handleSharedInbox)
 	mux.HandleFunc(pathMedia, g.handleMedia)
 	mux.HandleFunc(pathStatic, g.handleStatic)
@@ -207,6 +224,29 @@ func (g *gateway) handleUsers(w http.ResponseWriter, r *http.Request) {
 
 func (g *gateway) serveActor(w http.ResponseWriter, wu warpnetUser) {
 	writeJSON(w, contentTypeAP, g.buildActor(wu))
+}
+
+// handleInstanceActor serves the gateway's own Application actor. It carries the
+// gateway signing key so peers can verify our authorized-fetch GETs; it is not
+// a Warpnet user and resolves without a network round-trip.
+func (g *gateway) handleInstanceActor(w http.ResponseWriter, _ *http.Request) {
+	id := g.instanceActorID()
+	writeJSON(w, contentTypeAP, actor{
+		Context:           []any{asContext, secContext},
+		ID:                id,
+		Type:              "Application",
+		PreferredUsername: "warpnet-gw",
+		Inbox:             g.baseURL() + pathInbox,
+		Outbox:            id + "/outbox",
+		Followers:         id + pathFollowers,
+		Following:         id + "/following",
+		PublicKey: publicKey{
+			ID:           g.instanceKeyID(),
+			Owner:        id,
+			PublicKeyPEM: g.keyPubPEM,
+		},
+		Endpoints: &actorEndpoints{SharedInbox: g.baseURL() + pathInbox},
+	})
 }
 
 // buildActor renders the actor document. Shared by serveActor (served on GET)
@@ -512,12 +552,8 @@ func (g *gateway) fetchActor(ctx context.Context, actorURL string) (map[string]a
 		return nil, err
 	}
 	req.Header.Set("Accept", contentTypeAP)
-	// Sign the fetch only when a signing user is configured (authorized-fetch /
-	// secure-mode peers require it); otherwise fetch unsigned.
-	if g.signingUser != "" {
-		if err := signRequest(req, g.keyID(g.signingUser), g.key, nil); err != nil {
-			return nil, err
-		}
+	if err := g.signGet(req); err != nil {
+		return nil, err
 	}
 	resp, err := g.client.Do(req) //nolint:gosec // see G704 note above
 	if err != nil {
@@ -594,6 +630,9 @@ func (g *gateway) apGetJSON(ctx context.Context, rawURL, accept string) (map[str
 		return nil, err
 	}
 	req.Header.Set("Accept", accept)
+	if err := g.signGet(req); err != nil {
+		return nil, err
+	}
 	resp, err := g.client.Do(req) //nolint:gosec // see note above
 	if err != nil {
 		return nil, err
@@ -623,6 +662,9 @@ func (g *gateway) fetchMedia(ctx context.Context, rawURL string) (string, []byte
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil) //nolint:gosec // SSRF-guarded + safe client
 	if err != nil {
+		return "", nil, err
+	}
+	if err := g.signGet(req); err != nil {
 		return "", nil, err
 	}
 	resp, err := g.client.Do(req) //nolint:gosec // see note above
