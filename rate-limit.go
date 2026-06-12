@@ -124,18 +124,50 @@ func (rl *rateLimiters) client(ip string) *ratelimiter.Limiter {
 func (rl *rateLimiters) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lim := rl.client(clientIP(r))
-		if rl.global.IsLocked() || lim.IsLocked() {
+		// The federation control plane (our actor document, inbox, webfinger) is
+		// exempt from the shared global budget: peers fetch our signing key from
+		// the actor document to verify every delivery, so crawlers exhausting the
+		// global budget must never lock it out (that breaks follow/reply/like).
+		// The per-client budget still applies, so a single abusive IP is capped.
+		ctrl := isControlPlane(r.URL.Path)
+		if lim.IsLocked() || (!ctrl && rl.global.IsLocked()) {
 			w.Header().Set("Retry-After", strconv.Itoa(int(rl.window/time.Second)))
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 		weight := requestWeight(r)
+		if ctrl {
+			lim.Limit(weight, func() {
+				next.ServeHTTP(w, r)
+			})
+			return
+		}
 		rl.global.Limit(weight, func() {
 			lim.Limit(weight, func() {
 				next.ServeHTTP(w, r)
 			})
 		})
 	})
+}
+
+// isControlPlane reports whether the path is part of the federation control
+// plane (actor document, any inbox, webfinger) that peers must always reach to
+// verify and deliver activities. Collections and media stay data-plane.
+func isControlPlane(p string) bool {
+	if p == pathInbox || p == pathActor || strings.HasPrefix(p, "/.well-known/webfinger") {
+		return true
+	}
+	if strings.HasPrefix(p, pathUsers) {
+		rest := strings.TrimPrefix(p, pathUsers)
+		i := strings.IndexByte(rest, '/')
+		if i < 0 {
+			return true // actor document /users/{id}
+		}
+		sub := rest[i+1:]
+		// /users/{id}/ (trailing slash) is also served as the actor document.
+		return sub == "" || strings.HasPrefix(sub, "inbox")
+	}
+	return false
 }
 
 // clientIP keys the limiter. Tailscale Funnel's listener preserves the public
