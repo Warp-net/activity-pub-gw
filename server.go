@@ -64,15 +64,22 @@ const (
 	// maxRedirects caps redirect hops for outbound federation fetches.
 	maxRedirects = 5
 
-	pathUsers     = "/users/"
-	pathInbox     = "/inbox"
-	pathActor     = "/actor"
-	pathFollowers = "/followers"
-	pathStatuses  = "/statuses/"
-	pathMedia     = "/media/"
+	pathUsers = "/users/"
+	pathInbox = "/inbox"
+	pathActor = "/actor"
+	// instanceActorName is the preferredUsername of the gateway instance actor
+	// (served at /actor); it is webfinger-resolvable so peers can cache it.
+	instanceActorName = "warpnet-gw"
+	pathFollowers     = "/followers"
+	pathStatuses      = "/statuses/"
+	pathMedia         = "/media/"
 
 	headerContentType = "Content-Type"
 )
+
+// userAgent identifies the gateway on outbound Fediverse requests; some
+// instances and CDNs reject the default Go user-agent.
+const userAgent = "warpnet-gateway/" + gatewayVersion
 
 var (
 	errActorMalformed   = errors.New("actor document malformed")
@@ -173,6 +180,16 @@ func (g *gateway) handleWebFinger(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// The gateway instance actor must be webfinger-resolvable: peers webfinger
+	// the keyId actor after fetching it, and a 404 makes them re-resolve on
+	// every signed request (a fetch storm against /actor).
+	if user == instanceActorName {
+		writeJSON(w, contentTypeJRD, webFingerJRD{
+			Subject: "acct:" + user + "@" + g.host,
+			Links:   []webFingerLink{{Rel: "self", Type: contentTypeAP, Href: g.instanceActorID()}},
+		})
+		return
+	}
 	if _, ok := g.source.GetUser(user); !ok {
 		http.NotFound(w, r)
 		return
@@ -234,11 +251,14 @@ func (g *gateway) serveActor(w http.ResponseWriter, wu warpnetUser) {
 // a Warpnet user and resolves without a network round-trip.
 func (g *gateway) handleInstanceActor(w http.ResponseWriter, _ *http.Request) {
 	id := g.instanceActorID()
+	// The instance actor and its key are static — let peers cache them instead
+	// of re-fetching on every signed request.
+	w.Header().Set("Cache-Control", "max-age=3600")
 	writeJSON(w, contentTypeAP, actor{
 		Context:           []any{asContext, secContext},
 		ID:                id,
 		Type:              "Application",
-		PreferredUsername: "warpnet-gw",
+		PreferredUsername: instanceActorName,
 		Inbox:             g.baseURL() + pathInbox,
 		Outbox:            id + "/outbox",
 		Followers:         id + pathFollowers,
@@ -569,6 +589,9 @@ func (g *gateway) sendRetry(ctx context.Context, newReq func() (*http.Request, e
 		req, rerr := newReq()
 		if rerr != nil {
 			return fmt.Errorf("%w: %w", rerr, retrier.ErrStopTrying)
+		}
+		if req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", userAgent)
 		}
 		resp, rerr := g.client.Do(req) //nolint:gosec // SSRF-guarded by validateRemoteURL + safe client
 		if rerr != nil {

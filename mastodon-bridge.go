@@ -92,7 +92,19 @@ func (b *mastodonBridge) resolveHandle(ctx context.Context, handle string) (stri
 
 // --- reads (Mastodon -> Warpnet) ---
 
+// GetUser resolves a handle to a full profile including follower/following/
+// tweet counts (3 extra collection fetches). Use it for a direct profile view.
 func (b *mastodonBridge) GetUser(ctx context.Context, handle string) (user, error) {
+	return b.getUser(ctx, handle, true)
+}
+
+// GetUserBrief resolves a handle without the count fetches — for list contexts
+// (who-to-follow, search) where counts aren't shown, avoiding 3 fetches per row.
+func (b *mastodonBridge) GetUserBrief(ctx context.Context, handle string) (user, error) {
+	return b.getUser(ctx, handle, false)
+}
+
+func (b *mastodonBridge) getUser(ctx context.Context, handle string, withCounts bool) (user, error) {
 	actorURL, err := b.resolveHandle(ctx, handle)
 	if err != nil {
 		return user{}, err
@@ -102,6 +114,9 @@ func (b *mastodonBridge) GetUser(ctx context.Context, handle string) (user, erro
 		return user{}, err
 	}
 	u := actorToUser(handle, actorURL, m, b.nodeID)
+	if !withCounts {
+		return u, nil
+	}
 	// The three collection fetches run in parallel so one slow endpoint does
 	// not eat the whole nodeserver request budget.
 	counts := make([]int64, 3)
@@ -216,7 +231,8 @@ func (b *mastodonBridge) GetTweet(ctx context.Context, noteURL string) (tweet, e
 	return t, nil
 }
 
-// GetReplies fetches the first page of a Note's replies collection.
+// GetReplies reads a Note's replies collection, walking a bounded number of
+// pages and dereferencing items that are note URIs.
 func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (repliesResponse, error) {
 	m, err := b.ap.apGetJSON(ctx, strings.TrimPrefix(noteURL, domain.RetweetPrefix), contentTypeAP)
 	if err != nil {
@@ -232,26 +248,51 @@ func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (replie
 		return resp, nil //nolint:nilerr // hidden/absent replies -> empty, not an error
 	}
 	page := asMap(coll["first"])
+	pageURL := ""
 	if page == nil {
-		if u := asString(coll["first"]); u != "" {
-			page, _ = b.ap.apGetJSON(ctx, u, contentTypeAP)
-		}
+		pageURL = asString(coll["first"])
 	}
-	if page == nil {
-		return resp, nil
-	}
-	items := asSlice(page["items"])
-	if len(items) == 0 {
-		items = asSlice(page["orderedItems"]) // Mastodon uses items; others orderedItems
-	}
-	for _, it := range items {
-		note := asMap(it)
-		if note == nil {
-			continue
+	// Walk a bounded number of pages: Mastodon's replies collection lists items
+	// as note URIs (strings), so each is dereferenced; some servers inline the
+	// note objects instead. Bounded so a long thread can't run unbounded fetches.
+	const (
+		maxReplies = 50
+		maxPages   = 5
+	)
+	for p := 0; p < maxPages && len(resp.Replies) < maxReplies; p++ {
+		if page == nil {
+			if pageURL == "" {
+				break
+			}
+			page, _ = b.ap.apGetJSON(ctx, pageURL, contentTypeAP)
+			if page == nil {
+				break
+			}
 		}
-		if t, ok := noteToTweet(handleFromActorURL(asString(note["attributedTo"])), note); ok {
-			resp.Replies = append(resp.Replies, domain.ReplyNode{Reply: t})
+		items := asSlice(page["items"])
+		if len(items) == 0 {
+			items = asSlice(page["orderedItems"]) // Mastodon uses items; others orderedItems
 		}
+		for _, it := range items {
+			if len(resp.Replies) >= maxReplies {
+				break
+			}
+			note := asMap(it)
+			if note == nil {
+				// item is a note URI (Mastodon's usual form) — dereference it.
+				if u := asString(it); u != "" {
+					note, _ = b.ap.apGetJSON(ctx, u, contentTypeAP)
+				}
+			}
+			if note == nil {
+				continue
+			}
+			if t, ok := noteToTweet(handleFromActorURL(asString(note["attributedTo"])), note); ok {
+				resp.Replies = append(resp.Replies, domain.ReplyNode{Reply: t})
+			}
+		}
+		pageURL = asString(page["next"])
+		page = nil
 	}
 	return resp, nil
 }

@@ -74,7 +74,7 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 			return b.GetUser(ctx, string(ev.UserId))
 		}),
 		routeGetUsers: wrapJSON(func(ctx context.Context, ev getAllUsersEvent) (any, error) {
-			u, err := b.GetUser(ctx, string(ev.UserId))
+			u, err := b.GetUserBrief(ctx, string(ev.UserId)) // list context: skip count fetches
 			if err != nil {
 				return event.UsersResponse{}, nil //nolint:nilerr // unknown handle -> empty
 			}
@@ -86,8 +86,14 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 		routeGetTweet: wrapJSON(func(ctx context.Context, ev getTweetEvent) (any, error) {
 			return b.GetTweet(ctx, string(ev.TweetId))
 		}),
-		routeGetReplies: wrapJSON(func(ctx context.Context, ev getTweetEvent) (any, error) {
-			return b.GetReplies(ctx, string(ev.TweetId))
+		routeGetReplies: wrapJSON(func(ctx context.Context, ev getRepliesEvent) (any, error) {
+			// The note whose replies are wanted is the parent (a specific reply)
+			// or the thread root for top-level replies; both are AP note URLs.
+			id := string(ev.ParentId)
+			if id == "" {
+				id = string(ev.RootId)
+			}
+			return b.GetReplies(ctx, id)
 		}),
 		event.PUBLIC_GET_TWEET_STATS: wrapJSON(func(ctx context.Context, ev getTweetEvent) (any, error) {
 			return b.GetTweetStats(ctx, string(ev.TweetId))
