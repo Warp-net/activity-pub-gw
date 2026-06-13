@@ -69,6 +69,7 @@ type (
 	getAllUsersEvent   = event.GetAllUsersEvent
 	usersResponse      = event.UsersResponse
 	getTweetEvent      = event.GetTweetEvent
+	getRepliesEvent    = event.GetAllRepliesEvent
 	getAllTweetsEvent  = event.GetAllTweetsEvent
 	tweetsResponse     = event.TweetsResponse
 	repliesResponse    = event.RepliesResponse
