@@ -250,6 +250,8 @@ func (g *gateway) buildActor(wu warpnetUser) actor {
 	}
 	if wu.Background != "" {
 		a.Image = &attachment{Type: "Image", URL: g.baseURL() + pathMedia + encodeMediaRef(wu.PreferredUsername, wu.Background)}
+	} else {
+		a.Image = &attachment{Type: "Image", URL: g.baseURL() + warpnetHeaderPath}
 	}
 	return a
 }

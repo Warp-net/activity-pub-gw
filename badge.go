@@ -33,9 +33,10 @@ import (
 	"net/http"
 )
 
-// staticFS holds the Warpnet logo served as the actor's custom emoji badge.
+// staticFS holds the Warpnet logo served as the actor's custom emoji badge and
+// the brand-color header banner used as the bridged-profile fallback.
 //
-//go:embed static/warpnet.png
+//go:embed static/warpnet.png static/warpnet-header.png
 var staticFS embed.FS
 
 const (
@@ -45,6 +46,11 @@ const (
 	// display name; Mastodon replaces it with the Warpnet logo inline.
 	warpnetEmojiShortcode = ":warpnet:"
 	warpnetBadgePath      = pathStatic + "warpnet.png"
+
+	// warpnetHeaderPath is the brand-color (#C5007F) header banner served as the
+	// actor's image fallback, so a Fediverse viewer sees a recognizable Warpnet
+	// "server color" on profiles that have no background of their own.
+	warpnetHeaderPath = pathStatic + "warpnet-header.png"
 
 	// warpnetBioPrefix is prepended (as HTML) to the bio so a Mastodon visitor
 	// sees the account belongs to the Warpnet network, not a Mastodon instance.
