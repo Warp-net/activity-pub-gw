@@ -735,3 +735,46 @@ func TestSendRetry(t *testing.T) {
 		}
 	})
 }
+
+func TestGetRepliesDereferencesURIItems(t *testing.T) {
+	g := testGateway(t)
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/note":
+			writeJSON(w, contentTypeAP, map[string]any{
+				"type": "Note", "id": srv.URL + "/note", "replies": srv.URL + "/note/replies",
+			})
+		case r.URL.Path == "/note/replies" && r.URL.RawQuery == "":
+			// Mastodon-style: first is a page URL.
+			writeJSON(w, contentTypeAP, map[string]any{
+				"type": "Collection", "id": srv.URL + "/note/replies",
+				"first": srv.URL + "/note/replies?page=true",
+			})
+		case r.URL.Path == "/note/replies" && r.URL.RawQuery == "page=true":
+			// items are note URIs (strings), as Mastodon emits them.
+			writeJSON(w, contentTypeAP, map[string]any{
+				"type": "CollectionPage", "id": srv.URL + "/note/replies?page=true",
+				"items": []any{srv.URL + "/r1", srv.URL + "/r2"},
+			})
+		case r.URL.Path == "/r1" || r.URL.Path == "/r2":
+			writeJSON(w, contentTypeAP, map[string]any{
+				"type": "Note", "id": srv.URL + r.URL.Path,
+				"attributedTo": srv.URL + "/users/bob", "content": "reply " + r.URL.Path,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+
+	b := newMastodonBridge(g, "node1")
+	resp, err := b.GetReplies(context.Background(), srv.URL+"/note")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(resp.Replies) != 2 {
+		t.Fatalf("replies = %d, want 2: %+v", len(resp.Replies), resp.Replies)
+	}
+}
