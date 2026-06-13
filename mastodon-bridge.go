@@ -231,7 +231,8 @@ func (b *mastodonBridge) GetTweet(ctx context.Context, noteURL string) (tweet, e
 	return t, nil
 }
 
-// GetReplies fetches the first page of a Note's replies collection.
+// GetReplies reads a Note's replies collection, walking a bounded number of
+// pages and dereferencing items that are note URIs.
 func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (repliesResponse, error) {
 	m, err := b.ap.apGetJSON(ctx, strings.TrimPrefix(noteURL, domain.RetweetPrefix), contentTypeAP)
 	if err != nil {
