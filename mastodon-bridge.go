@@ -232,26 +232,51 @@ func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (replie
 		return resp, nil //nolint:nilerr // hidden/absent replies -> empty, not an error
 	}
 	page := asMap(coll["first"])
+	pageURL := ""
 	if page == nil {
-		if u := asString(coll["first"]); u != "" {
-			page, _ = b.ap.apGetJSON(ctx, u, contentTypeAP)
-		}
+		pageURL = asString(coll["first"])
 	}
-	if page == nil {
-		return resp, nil
-	}
-	items := asSlice(page["items"])
-	if len(items) == 0 {
-		items = asSlice(page["orderedItems"]) // Mastodon uses items; others orderedItems
-	}
-	for _, it := range items {
-		note := asMap(it)
-		if note == nil {
-			continue
+	// Walk a bounded number of pages: Mastodon's replies collection lists items
+	// as note URIs (strings), so each is dereferenced; some servers inline the
+	// note objects instead. Bounded so a long thread can't run unbounded fetches.
+	const (
+		maxReplies = 50
+		maxPages   = 5
+	)
+	for p := 0; p < maxPages && len(resp.Replies) < maxReplies; p++ {
+		if page == nil {
+			if pageURL == "" {
+				break
+			}
+			page, _ = b.ap.apGetJSON(ctx, pageURL, contentTypeAP)
+			if page == nil {
+				break
+			}
 		}
-		if t, ok := noteToTweet(handleFromActorURL(asString(note["attributedTo"])), note); ok {
-			resp.Replies = append(resp.Replies, domain.ReplyNode{Reply: t})
+		items := asSlice(page["items"])
+		if len(items) == 0 {
+			items = asSlice(page["orderedItems"]) // Mastodon uses items; others orderedItems
 		}
+		for _, it := range items {
+			if len(resp.Replies) >= maxReplies {
+				break
+			}
+			note := asMap(it)
+			if note == nil {
+				// item is a note URI (Mastodon's usual form) — dereference it.
+				if u := asString(it); u != "" {
+					note, _ = b.ap.apGetJSON(ctx, u, contentTypeAP)
+				}
+			}
+			if note == nil {
+				continue
+			}
+			if t, ok := noteToTweet(handleFromActorURL(asString(note["attributedTo"])), note); ok {
+				resp.Replies = append(resp.Replies, domain.ReplyNode{Reply: t})
+			}
+		}
+		pageURL = asString(page["next"])
+		page = nil
 	}
 	return resp, nil
 }
