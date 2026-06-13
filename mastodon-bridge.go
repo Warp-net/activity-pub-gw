@@ -92,7 +92,19 @@ func (b *mastodonBridge) resolveHandle(ctx context.Context, handle string) (stri
 
 // --- reads (Mastodon -> Warpnet) ---
 
+// GetUser resolves a handle to a full profile including follower/following/
+// tweet counts (3 extra collection fetches). Use it for a direct profile view.
 func (b *mastodonBridge) GetUser(ctx context.Context, handle string) (user, error) {
+	return b.getUser(ctx, handle, true)
+}
+
+// GetUserBrief resolves a handle without the count fetches — for list contexts
+// (who-to-follow, search) where counts aren't shown, avoiding 3 fetches per row.
+func (b *mastodonBridge) GetUserBrief(ctx context.Context, handle string) (user, error) {
+	return b.getUser(ctx, handle, false)
+}
+
+func (b *mastodonBridge) getUser(ctx context.Context, handle string, withCounts bool) (user, error) {
 	actorURL, err := b.resolveHandle(ctx, handle)
 	if err != nil {
 		return user{}, err
@@ -102,6 +114,9 @@ func (b *mastodonBridge) GetUser(ctx context.Context, handle string) (user, erro
 		return user{}, err
 	}
 	u := actorToUser(handle, actorURL, m, b.nodeID)
+	if !withCounts {
+		return u, nil
+	}
 	// The three collection fetches run in parallel so one slow endpoint does
 	// not eat the whole nodeserver request budget.
 	counts := make([]int64, 3)
