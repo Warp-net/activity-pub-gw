@@ -146,13 +146,23 @@ func (b *mastodonBridge) collectionCount(ctx context.Context, collURL string) in
 	return int64(apCollectionCount(m)) //nolint:gosec
 }
 
+// pageCursor returns the cursor as a Fediverse page URL, or "" when it is not
+// one. Warpnet paginates the gateway's read routes with the requesting node's
+// own datastore cursor (e.g. "/TWEETS/<user>/<seq>/<noteURL>"), not the AP
+// "next" URL the gateway returned, so a non-https cursor is meaningless to the
+// Fediverse: the gateway restarts from the first page rather than dereference
+// it (which would otherwise fail the https SSRF guard).
+func pageCursor(cursor *string) string {
+	if cursor == nil || !strings.HasPrefix(*cursor, "https://") {
+		return ""
+	}
+	return *cursor
+}
+
 // GetTweets renders a remote actor's outbox as Warpnet tweets. cursor, when set,
 // is the next OrderedCollectionPage URL.
 func (b *mastodonBridge) GetTweets(ctx context.Context, handle string, cursor *string) (tweetsResponse, error) {
-	pageURL := ""
-	if cursor != nil {
-		pageURL = *cursor
-	}
+	pageURL := pageCursor(cursor)
 	if pageURL == "" {
 		actorURL, err := b.resolveHandle(ctx, handle)
 		if err != nil {
@@ -334,10 +344,7 @@ func (b *mastodonBridge) GetFollowings(ctx context.Context, handle string, curso
 // followList resolves the actor's follower/following collection to handles.
 // Instances that hide the member list yield an empty result.
 func (b *mastodonBridge) followList(ctx context.Context, handle string, cursor *string, field string) ([]string, string, error) {
-	pageURL := ""
-	if cursor != nil {
-		pageURL = *cursor
-	}
+	pageURL := pageCursor(cursor)
 	if pageURL == "" {
 		actorURL, err := b.resolveHandle(ctx, handle)
 		if err != nil {

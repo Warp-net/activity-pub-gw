@@ -778,3 +778,53 @@ func TestGetRepliesDereferencesURIItems(t *testing.T) {
 		t.Fatalf("replies = %d, want 2: %+v", len(resp.Replies), resp.Replies)
 	}
 }
+
+// Warpnet paginates GET_TWEETS with the requesting node's own datastore cursor
+// (e.g. "/TWEETS/<user>/<seq>/<noteURL>"), not the AP "next" URL the gateway
+// returned. The gateway must ignore such a cursor and serve the first outbox
+// page rather than dereference it (which fails the https check, breaking the
+// whole response).
+func TestGetTweetsIgnoresDatastoreCursor(t *testing.T) {
+	g := testGateway(t)
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/.well-known/webfinger":
+			writeJSON(w, contentTypeJRD, map[string]any{
+				"links": []any{map[string]any{"rel": "self", "href": srv.URL + "/users/alice"}},
+			})
+		case r.URL.Path == "/users/alice":
+			writeJSON(w, contentTypeAP, map[string]any{
+				"type": "Person", "id": srv.URL + "/users/alice", "outbox": srv.URL + "/outbox",
+			})
+		case r.URL.Path == "/outbox" && r.URL.RawQuery == "":
+			writeJSON(w, contentTypeAP, map[string]any{
+				"type": "OrderedCollection", "id": srv.URL + "/outbox",
+				"first": srv.URL + "/outbox?page=true",
+			})
+		case r.URL.Path == "/outbox" && r.URL.RawQuery == "page=true":
+			writeJSON(w, contentTypeAP, map[string]any{
+				"type": "OrderedCollectionPage", "id": srv.URL + "/outbox?page=true",
+				"orderedItems": []any{map[string]any{
+					"type": typeNote, "id": srv.URL + "/statuses/1",
+					"attributedTo": srv.URL + "/users/alice", "content": "hello",
+				}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+
+	b := newMastodonBridge(g, "node1")
+	handle := "alice@" + strings.TrimPrefix(srv.URL, "https://")
+	cursor := "/TWEETS/" + handle + "/9223372035074277473/" + srv.URL + "/statuses/1"
+	resp, err := b.GetTweets(context.Background(), handle, &cursor)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(resp.Tweets) != 1 || resp.Tweets[0].Id != srv.URL+"/statuses/1" {
+		t.Fatalf("tweets = %+v, want first-page note", resp.Tweets)
+	}
+}
