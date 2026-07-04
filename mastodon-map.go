@@ -32,8 +32,11 @@ package main
 // dependency on the gateway, so they are trivially unit-testable.
 
 import (
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	stripper "github.com/grokify/html-strip-tags-go"
 	log "github.com/sirupsen/logrus"
@@ -91,7 +94,7 @@ func noteToTweet(authorHandle string, note map[string]any) (tweet, bool) {
 		// ParentId; replies point both at the parent (AP gives only the
 		// immediate inReplyTo, not the thread root).
 		RootId:    id,
-		Text:      stripper.StripTags(asString(note["content"])),
+		Text:      htmlToText(asString(note["content"])),
 		UserId:    username,
 		Username:  username,
 		CreatedAt: parseAPTime(asString(note["published"])),
@@ -100,6 +103,23 @@ func noteToTweet(authorHandle string, note map[string]any) (tweet, bool) {
 	if parent := asString(note["inReplyTo"]); parent != "" {
 		t.RootId = parent
 		t.ParentId = &parent
+	}
+	if q := quotedNoteURL(note); q != "" {
+		setQuoted(&t, q)
+		if _, comment, ok := splitREQuote(t.Text); ok && comment != "" {
+			t.Text = comment // drop the "RE: <url>" text fallback; the embedded preview shows the source
+		}
+	} else if q, comment, ok := splitREQuote(t.Text); ok && comment != "" {
+		setQuoted(&t, q)
+		t.Text = comment
+	} else if t.ParentId == nil {
+		if parent, rest, ok := splitREPrefix(t.Text); ok {
+			t.RootId = parent
+			t.ParentId = &parent
+			if rest != "" {
+				t.Text = rest
+			}
+		}
 	}
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now()
@@ -117,6 +137,95 @@ func noteToTweet(authorHandle string, note map[string]any) (tweet, bool) {
 		}
 	}
 	return t, true
+}
+
+var lineBreakTags = regexp.MustCompile(`(?i)<br\s*/?>|</p>`)
+
+// htmlToText flattens a note's HTML content to plain text, keeping <br> and
+// paragraph breaks as newlines so line-oriented conventions (the "RE:" quote
+// fallback) survive tag stripping instead of gluing onto the comment.
+func htmlToText(html string) string {
+	return strings.TrimSpace(stripper.StripTags(lineBreakTags.ReplaceAllString(html, "\n")))
+}
+
+// quotedNoteURL reads the quote properties Fediverse servers attach to a quote
+// post (Misskey-family quoteUri/quoteUrl/_misskey_quote, Mastodon/FEP quote),
+// tolerating the string, {"id"} and {"href"} forms.
+func quotedNoteURL(note map[string]any) string {
+	for _, k := range []string{"quoteUri", "quoteUrl", "_misskey_quote", "quote"} {
+		u := asString(note[k])
+		if u == "" {
+			u = asString(asMap(note[k])["href"])
+		}
+		if strings.HasPrefix(u, "https://") {
+			return u
+		}
+	}
+	return ""
+}
+
+// setQuoted marks t as a quote of the note at qURL, deriving quoted_user_id
+// from the URL when it carries the author (the client routes its quoted-source
+// fetch by that id); URLs without an author are resolved later by the bridge.
+func setQuoted(t *tweet, qURL string) {
+	t.QuotedTweetId = &qURL
+	if h := statusAuthorHandle(qURL); h != "" {
+		t.QuotedUserId = &h
+	}
+}
+
+// statusAuthorHandle derives the author's "name@host" handle from a status URL
+// that embeds the author (/users/{name}/statuses/{id} or /@{name}/{id}); ""
+// when it doesn't (e.g. Misskey's /notes/{id}).
+func statusAuthorHandle(statusURL string) string {
+	u, err := url.Parse(statusURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+	switch {
+	case len(segs) >= 3 && segs[0] == "users" && segs[1] != "" && segs[2] == "statuses":
+		return segs[1] + "@" + u.Host
+	case len(segs) >= 2 && len(segs[0]) > 1 && segs[0][0] == '@':
+		return segs[0][1:] + "@" + u.Host
+	}
+	return ""
+}
+
+// splitREQuote parses the Misskey-style quote fallback — text closing with an
+// "RE: <status URL>" line appended after the comment (comment is "" when the
+// fallback is the whole text). The URL must end the note; a mid-word "RE:"
+// (MORE:, SCORE:) does not match.
+func splitREQuote(text string) (quotedURL, comment string, ok bool) {
+	trimmed := strings.TrimSpace(text)
+	i := strings.LastIndex(trimmed, "RE: https://")
+	if i < 0 || (i > 0 && !unicode.IsSpace(rune(trimmed[i-1]))) {
+		return "", "", false
+	}
+	quotedURL = trimmed[i+len("RE: "):]
+	if strings.IndexFunc(quotedURL, unicode.IsSpace) >= 0 {
+		return "", "", false
+	}
+	return quotedURL, strings.TrimSpace(trimmed[:i]), true
+}
+
+// splitREPrefix parses the Fediverse quote-post convention — a note whose text
+// starts with "RE: <status URL>" instead of carrying inReplyTo — returning the
+// quoted status URL and the remaining text. Only https URLs qualify (matching
+// the gateway's fetch guard).
+func splitREPrefix(text string) (parentURL, rest string, ok bool) {
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) < 3 || !strings.EqualFold(trimmed[:3], "re:") {
+		return "", "", false
+	}
+	parentURL = strings.TrimSpace(trimmed[3:])
+	if i := strings.IndexFunc(parentURL, unicode.IsSpace); i >= 0 {
+		parentURL, rest = parentURL[:i], strings.TrimSpace(parentURL[i:])
+	}
+	if !strings.HasPrefix(parentURL, "https://") {
+		return "", "", false
+	}
+	return parentURL, rest, true
 }
 
 // collectHandles maps a collection page's actor-URL items to Fediverse handles.

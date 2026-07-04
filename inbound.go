@@ -32,8 +32,6 @@ import (
 	"path"
 	"strings"
 	"time"
-
-	stripper "github.com/grokify/html-strip-tags-go"
 )
 
 const (
@@ -82,9 +80,45 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 		if obj == nil {
 			return "", nil, false
 		}
+		text := htmlToText(stringField(obj, "content"))
 		owner, parentID, ok := g.parseLocalStatus(stringField(obj, "inReplyTo"))
 		if !ok {
-			return "", nil, false
+			// Quote of one of our statuses — an explicit quote property, or
+			// the Misskey-style trailing "RE: <url>" fallback after a comment
+			// — maps to a Warpnet quote retweet.
+			qURL := quotedNoteURL(obj)
+			qu, comment, sok := splitREQuote(text)
+			if qURL == "" && sok && comment != "" {
+				qURL = qu
+			}
+			if qOwner, tweetID, qok := g.parseLocalStatus(qURL); qok {
+				if sok && comment != "" {
+					text = comment
+				}
+				by := encodeActorID(actor)
+				return routePostRetweet, tweet{
+					Id:            tweetID,
+					CreatedAt:     time.Now(),
+					UserId:        by,
+					Username:      handleFromActorURL(actor),
+					Text:          text,
+					RetweetedBy:   &by,
+					QuotedTweetId: &tweetID,
+					QuotedUserId:  &qOwner,
+				}, true
+			}
+			// Quote-post convention: the text opens with
+			// "RE: <our status URL>" — treat it as a reply to that status.
+			parentURL, rest, reOK := splitREPrefix(text)
+			if !reOK {
+				return "", nil, false
+			}
+			if owner, parentID, ok = g.parseLocalStatus(parentURL); !ok {
+				return "", nil, false
+			}
+			if rest != "" {
+				text = rest
+			}
 		}
 		pid := parentID
 		return routePostReply, newReplyEvent{
@@ -93,7 +127,7 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 			ParentId:     &pid,
 			ParentUserId: owner,
 			RootId:       parentID,
-			Text:         stripper.StripTags(stringField(obj, "content")),
+			Text:         text,
 			UserId:       encodeActorID(actor),
 			Username:     handleFromActorURL(actor),
 		}, true
