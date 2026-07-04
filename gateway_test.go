@@ -429,6 +429,27 @@ func TestTranslateInbound(t *testing.T) {
 		t.Fatalf("reply username = %q, want bob@m", reply.Username)
 	}
 
+	// Quote-post convention: no inReplyTo, text opens with "RE: <status URL>".
+	route, payload, ok = g.translateInbound(map[string]any{
+		"type": "Create", "actor": actor,
+		"object": map[string]any{"type": "Note", "content": "<p>RE: <a href=\"" + status + "\">" + status + "</a> nice post</p>"},
+	})
+	if !ok || route != routePostReply {
+		t.Fatalf("RE reply: route=%q ok=%v", route, ok)
+	}
+	reply = payload.(newReplyEvent)
+	if reply.RootId != "t1" || reply.ParentId == nil || *reply.ParentId != "t1" || reply.Text != "nice post" {
+		t.Fatalf("RE reply event: %+v", reply)
+	}
+
+	// RE: pointing at a foreign status is not ours to thread.
+	if _, _, ok := g.translateInbound(map[string]any{
+		"type": "Create", "actor": actor,
+		"object": map[string]any{"type": "Note", "content": "<p>RE: https://evil/users/x/statuses/9 hi</p>"},
+	}); ok {
+		t.Fatal("foreign RE quote should be unhandled")
+	}
+
 	if route, _, ok := g.translateInbound(map[string]any{
 		"type": "Undo", "actor": actor,
 		"object": map[string]any{"type": "Follow", "object": "https://gw.example/users/alice"},
@@ -470,6 +491,52 @@ func TestTranslateInbound(t *testing.T) {
 	}
 	if _, _, ok := g.translateInbound(map[string]any{"type": "Delete", "actor": actor, "object": status}); ok {
 		t.Fatal("delete should not translate to a node route")
+	}
+}
+
+func TestNoteToTweetREPrefix(t *testing.T) {
+	parent := "https://m/users/bob/statuses/42"
+
+	tw, ok := noteToTweet("alice@m", map[string]any{
+		"type": "Note", "id": "https://m/users/alice/statuses/1",
+		"content": "<p>RE: <a href=\"" + parent + "\">" + parent + "</a> agreed!</p>",
+	})
+	if !ok {
+		t.Fatal("note should map")
+	}
+	if tw.ParentId == nil || *tw.ParentId != parent || tw.RootId != parent {
+		t.Fatalf("RE quote should thread under %s: %+v", parent, tw)
+	}
+	if tw.Text != "agreed!" {
+		t.Fatalf("text = %q, want prefix stripped", tw.Text)
+	}
+
+	// Bare quote with no commentary keeps its original text.
+	tw, _ = noteToTweet("alice@m", map[string]any{
+		"type": "Note", "id": "https://m/users/alice/statuses/2",
+		"content": "<p>RE: " + parent + "</p>",
+	})
+	if tw.ParentId == nil || *tw.ParentId != parent || tw.Text != "RE: "+parent {
+		t.Fatalf("bare RE quote: %+v", tw)
+	}
+
+	// An explicit inReplyTo wins; the text is left alone.
+	tw, _ = noteToTweet("alice@m", map[string]any{
+		"type": "Note", "id": "https://m/users/alice/statuses/3",
+		"content": "<p>RE: https://other/users/x/statuses/9</p>", "inReplyTo": parent,
+	})
+	if tw.ParentId == nil || *tw.ParentId != parent || tw.Text != "RE: https://other/users/x/statuses/9" {
+		t.Fatalf("inReplyTo should win: %+v", tw)
+	}
+
+	// Non-URL and plain-word "RE:" texts stay top-level.
+	for _, content := range []string{"<p>RE: what you said</p>", "<p>REALLY good</p>", "<p>RE: http://insecure/1</p>"} {
+		tw, _ = noteToTweet("alice@m", map[string]any{
+			"type": "Note", "id": "https://m/users/alice/statuses/4", "content": content,
+		})
+		if tw.ParentId != nil {
+			t.Fatalf("%q should not thread: %+v", content, tw)
+		}
 	}
 }
 

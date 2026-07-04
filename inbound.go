@@ -82,9 +82,21 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 		if obj == nil {
 			return "", nil, false
 		}
+		text := stripper.StripTags(stringField(obj, "content"))
 		owner, parentID, ok := g.parseLocalStatus(stringField(obj, "inReplyTo"))
 		if !ok {
-			return "", nil, false
+			// Quote-post convention: no usable inReplyTo, but the text opens
+			// with "RE: <our status URL>" — treat it as a reply to that status.
+			parentURL, rest, reOK := splitREPrefix(text)
+			if !reOK {
+				return "", nil, false
+			}
+			if owner, parentID, ok = g.parseLocalStatus(parentURL); !ok {
+				return "", nil, false
+			}
+			if rest != "" {
+				text = rest
+			}
 		}
 		pid := parentID
 		return routePostReply, newReplyEvent{
@@ -93,7 +105,7 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 			ParentId:     &pid,
 			ParentUserId: owner,
 			RootId:       parentID,
-			Text:         stripper.StripTags(stringField(obj, "content")),
+			Text:         text,
 			UserId:       encodeActorID(actor),
 			Username:     handleFromActorURL(actor),
 		}, true

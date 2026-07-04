@@ -34,6 +34,7 @@ package main
 import (
 	"strings"
 	"time"
+	"unicode"
 
 	stripper "github.com/grokify/html-strip-tags-go"
 	log "github.com/sirupsen/logrus"
@@ -100,6 +101,12 @@ func noteToTweet(authorHandle string, note map[string]any) (tweet, bool) {
 	if parent := asString(note["inReplyTo"]); parent != "" {
 		t.RootId = parent
 		t.ParentId = &parent
+	} else if parent, rest, ok := splitREPrefix(t.Text); ok {
+		t.RootId = parent
+		t.ParentId = &parent
+		if rest != "" {
+			t.Text = rest
+		}
 	}
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now()
@@ -117,6 +124,25 @@ func noteToTweet(authorHandle string, note map[string]any) (tweet, bool) {
 		}
 	}
 	return t, true
+}
+
+// splitREPrefix parses the Fediverse quote-post convention — a note whose text
+// starts with "RE: <status URL>" instead of carrying inReplyTo — returning the
+// quoted status URL and the remaining text. Only https URLs qualify (matching
+// the gateway's fetch guard).
+func splitREPrefix(text string) (parentURL, rest string, ok bool) {
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) < 3 || !strings.EqualFold(trimmed[:3], "re:") {
+		return "", "", false
+	}
+	parentURL = strings.TrimSpace(trimmed[3:])
+	if i := strings.IndexFunc(parentURL, unicode.IsSpace); i >= 0 {
+		parentURL, rest = parentURL[:i], strings.TrimSpace(parentURL[i:])
+	}
+	if !strings.HasPrefix(parentURL, "https://") {
+		return "", "", false
+	}
+	return parentURL, rest, true
 }
 
 // collectHandles maps a collection page's actor-URL items to Fediverse handles.
