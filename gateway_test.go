@@ -473,6 +473,22 @@ func TestTranslateInbound(t *testing.T) {
 		t.Fatalf("quoter id round-trip: %q", *q.RetweetedBy)
 	}
 
+	// Quote property with a leading "RE:" fallback (Mastodon wire form)
+	// drops the fallback from the comment too.
+	route, payload, ok = g.translateInbound(map[string]any{
+		"type": "Create", "actor": actor,
+		"object": map[string]any{
+			"type": "Note", "quote": status,
+			"content": "<p>RE: <a href=\"" + status + "\">" + status + "</a></p><p>great idea</p>",
+		},
+	})
+	if !ok || route != routePostRetweet {
+		t.Fatalf("leading-fallback quote: route=%q ok=%v", route, ok)
+	}
+	if q := payload.(tweet); q.Text != "great idea" || q.QuotedTweetId == nil || *q.QuotedTweetId != "t1" {
+		t.Fatalf("leading-fallback quote event: %+v", q)
+	}
+
 	// Same via the text fallback alone (no quoteUri).
 	route, payload, ok = g.translateInbound(map[string]any{
 		"type": "Create", "actor": actor,
@@ -622,6 +638,20 @@ func TestNoteToTweetQuote(t *testing.T) {
 	}
 	if tw.QuotedUserId == nil || *tw.QuotedUserId != "bob@m" {
 		t.Fatalf("quoted_user_id: %+v", tw.QuotedUserId)
+	}
+
+	// Mastodon wire form: explicit quote property + leading "RE:" fallback
+	// before the comment.
+	tw, _ = noteToTweet("alice@m", map[string]any{
+		"type": "Note", "id": "https://m/users/alice/statuses/3",
+		"content": "<p>RE: <a href=\"" + mQuoted + "\">" + mQuoted + "</a></p><p>This is a great idea!</p>",
+		"quote":   mQuoted,
+	})
+	if tw.QuotedTweetId == nil || *tw.QuotedTweetId != mQuoted || tw.ParentId != nil {
+		t.Fatalf("leading-fallback quote: %+v", tw)
+	}
+	if tw.Text != "This is a great idea!" {
+		t.Fatalf("text = %q, want leading fallback stripped", tw.Text)
 	}
 
 	// A mid-word "RE:" (MORE:) or a URL not closing the note is no quote.

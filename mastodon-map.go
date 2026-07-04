@@ -106,7 +106,7 @@ func noteToTweet(authorHandle string, note map[string]any) (tweet, bool) {
 	}
 	if q := quotedNoteURL(note); q != "" {
 		setQuoted(&t, q)
-		if _, comment, ok := splitREQuote(t.Text); ok && comment != "" {
+		if comment, ok := stripQuoteFallback(t.Text); ok && comment != "" {
 			t.Text = comment // drop the "RE: <url>" text fallback; the embedded preview shows the source
 		}
 	} else if q, comment, ok := splitREQuote(t.Text); ok && comment != "" {
@@ -207,6 +207,19 @@ func splitREQuote(text string) (quotedURL, comment string, ok bool) {
 		return "", "", false
 	}
 	return quotedURL, strings.TrimSpace(trimmed[:i]), true
+}
+
+// stripQuoteFallback removes the "RE: <status URL>" text fallback a quoting
+// server adds to a quote post's content — trailing (Misskey) or leading
+// (Mastodon) — returning the remaining comment.
+func stripQuoteFallback(text string) (string, bool) {
+	if _, comment, ok := splitREQuote(text); ok {
+		return comment, true
+	}
+	if _, rest, ok := splitREPrefix(text); ok {
+		return rest, true
+	}
+	return text, false
 }
 
 // splitREPrefix parses the Fediverse quote-post convention — a note whose text
