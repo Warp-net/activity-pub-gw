@@ -450,6 +450,52 @@ func TestTranslateInbound(t *testing.T) {
 		t.Fatal("foreign RE quote should be unhandled")
 	}
 
+	// Quote of a local status (Misskey wire: quoteUri + "RE:" text fallback)
+	// maps to a quote retweet.
+	route, payload, ok = g.translateInbound(map[string]any{
+		"type": "Create", "actor": actor,
+		"object": map[string]any{
+			"type": "Note", "quoteUri": status,
+			"content": "<p>hot take<br>RE: <a href=\"" + status + "\">" + status + "</a></p>",
+		},
+	})
+	if !ok || route != routePostRetweet {
+		t.Fatalf("quote: route=%q ok=%v", route, ok)
+	}
+	q := payload.(tweet)
+	if q.Id != "t1" || q.QuotedTweetId == nil || *q.QuotedTweetId != "t1" || q.QuotedUserId == nil || *q.QuotedUserId != "alice" {
+		t.Fatalf("quote event: %+v", q)
+	}
+	if q.Text != "hot take" || q.RetweetedBy == nil || q.UserId != *q.RetweetedBy {
+		t.Fatalf("quote comment/author: %+v", q)
+	}
+	if got, _ := decodeActorID(*q.RetweetedBy); got != actor {
+		t.Fatalf("quoter id round-trip: %q", *q.RetweetedBy)
+	}
+
+	// Same via the text fallback alone (no quoteUri).
+	route, payload, ok = g.translateInbound(map[string]any{
+		"type": "Create", "actor": actor,
+		"object": map[string]any{"type": "Note", "content": "<p>nice<br>RE: " + status + "</p>"},
+	})
+	if !ok || route != routePostRetweet {
+		t.Fatalf("text-fallback quote: route=%q ok=%v", route, ok)
+	}
+	if q := payload.(tweet); q.Text != "nice" || q.QuotedTweetId == nil || *q.QuotedTweetId != "t1" {
+		t.Fatalf("text-fallback quote event: %+v", q)
+	}
+
+	// A quote of a foreign status is not ours to store.
+	if _, _, ok := g.translateInbound(map[string]any{
+		"type": "Create", "actor": actor,
+		"object": map[string]any{
+			"type": "Note", "quoteUri": "https://evil/users/x/statuses/9",
+			"content": "<p>look</p>",
+		},
+	}); ok {
+		t.Fatal("foreign quote should be unhandled")
+	}
+
 	if route, _, ok := g.translateInbound(map[string]any{
 		"type": "Undo", "actor": actor,
 		"object": map[string]any{"type": "Follow", "object": "https://gw.example/users/alice"},
@@ -536,6 +582,58 @@ func TestNoteToTweetREPrefix(t *testing.T) {
 		})
 		if tw.ParentId != nil {
 			t.Fatalf("%q should not thread: %+v", content, tw)
+		}
+	}
+}
+
+func TestNoteToTweetQuote(t *testing.T) {
+	quoted := "https://misskey.example/notes/9abc"
+
+	// Misskey wire form: explicit quote property + glued "RE:" text fallback.
+	tw, ok := noteToTweet("alice@mi", map[string]any{
+		"type": "Note", "id": "https://misskey.example/notes/1",
+		"content":  "<p>great point!<br><br>RE: <a href=\"" + quoted + "\">" + quoted + "</a></p>",
+		"quoteUri": quoted,
+	})
+	if !ok {
+		t.Fatal("note should map")
+	}
+	if tw.QuotedTweetId == nil || *tw.QuotedTweetId != quoted {
+		t.Fatalf("quoted tweet id: %+v", tw)
+	}
+	if tw.Text != "great point!" {
+		t.Fatalf("text = %q, want fallback stripped", tw.Text)
+	}
+	if tw.ParentId != nil {
+		t.Fatalf("a quote is not a reply: %+v", tw)
+	}
+	if tw.QuotedUserId != nil {
+		t.Fatalf("/notes/ URL carries no author, want nil quoted_user_id: %+v", tw)
+	}
+
+	// Text-only trailing fallback; a Mastodon-shaped URL fills quoted_user_id.
+	mQuoted := "https://m/users/bob/statuses/42"
+	tw, _ = noteToTweet("alice@m", map[string]any{
+		"type": "Note", "id": "https://m/users/alice/statuses/2",
+		"content": "<p>согласен</p><p>RE: <a href=\"" + mQuoted + "\">" + mQuoted + "</a></p>",
+	})
+	if tw.QuotedTweetId == nil || *tw.QuotedTweetId != mQuoted || tw.Text != "согласен" {
+		t.Fatalf("text-fallback quote: %+v", tw)
+	}
+	if tw.QuotedUserId == nil || *tw.QuotedUserId != "bob@m" {
+		t.Fatalf("quoted_user_id: %+v", tw.QuotedUserId)
+	}
+
+	// A mid-word "RE:" (MORE:) or a URL not closing the note is no quote.
+	for _, content := range []string{
+		"<p>read MORE: https://m/users/x/statuses/9</p>",
+		"<p>intro<br>RE: https://m/users/x/statuses/9 and more words</p>",
+	} {
+		tw, _ = noteToTweet("alice@m", map[string]any{
+			"type": "Note", "id": "https://m/users/alice/statuses/3", "content": content,
+		})
+		if tw.QuotedTweetId != nil {
+			t.Fatalf("%q should not quote: %+v", content, tw)
 		}
 	}
 }

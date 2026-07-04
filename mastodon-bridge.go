@@ -218,6 +218,7 @@ func (b *mastodonBridge) activityToTweet(ctx context.Context, handle string, obj
 		if ok {
 			by := handle
 			t.RetweetedBy = &by
+			b.fillQuotedAuthor(ctx, &t)
 		}
 		return t, ok
 	}
@@ -225,7 +226,31 @@ func (b *mastodonBridge) activityToTweet(ctx context.Context, handle string, obj
 	if inner := asMap(obj["object"]); inner != nil {
 		note = inner
 	}
-	return noteToTweet(handle, note)
+	t, ok := noteToTweet(handle, note)
+	if ok {
+		b.fillQuotedAuthor(ctx, &t)
+	}
+	return t, ok
+}
+
+// fillQuotedAuthor resolves quoted_user_id for a quote whose quoted status URL
+// does not embed the author (e.g. Misskey's /notes/{id}) — the client routes
+// its quoted-source fetch by that id. Best-effort, one dereference.
+func (b *mastodonBridge) fillQuotedAuthor(ctx context.Context, t *tweet) {
+	if t.QuotedTweetId == nil || t.QuotedUserId != nil {
+		return
+	}
+	m, err := b.ap.apGetJSON(ctx, *t.QuotedTweetId, contentTypeAP)
+	if err != nil {
+		return
+	}
+	if inner := asMap(m["object"]); inner != nil {
+		m = inner
+	}
+	if author := asString(m["attributedTo"]); author != "" {
+		h := handleFromActorURL(author)
+		t.QuotedUserId = &h
+	}
 }
 
 // GetTweet fetches a single Note by its id (the AP object URL stored as tweet id).
@@ -237,7 +262,10 @@ func (b *mastodonBridge) GetTweet(ctx context.Context, noteURL string) (tweet, e
 	if inner := asMap(m["object"]); inner != nil {
 		m = inner
 	}
-	t, _ := noteToTweet(handleFromActorURL(asString(m["attributedTo"])), m)
+	t, ok := noteToTweet(handleFromActorURL(asString(m["attributedTo"])), m)
+	if ok {
+		b.fillQuotedAuthor(ctx, &t)
+	}
 	return t, nil
 }
 
@@ -298,6 +326,7 @@ func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (replie
 				continue
 			}
 			if t, ok := noteToTweet(handleFromActorURL(asString(note["attributedTo"])), note); ok {
+				b.fillQuotedAuthor(ctx, &t)
 				resp.Replies = append(resp.Replies, domain.ReplyNode{Reply: t})
 			}
 		}
