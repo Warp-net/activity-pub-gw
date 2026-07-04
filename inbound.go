@@ -92,8 +92,8 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 				qURL = qu
 			}
 			if qOwner, tweetID, qok := g.parseLocalStatus(qURL); qok {
-				if sok && comment != "" {
-					text = comment
+				if stripped, ok := stripQuoteFallback(text); ok && stripped != "" {
+					text = stripped
 				}
 				by := encodeActorID(actor)
 				return routePostRetweet, tweet{
