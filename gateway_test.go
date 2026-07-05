@@ -1178,6 +1178,19 @@ func TestLogsEndpoint(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "hello world") {
 		t.Fatalf("bearer code=%d body=%q", rec.Code, rec.Body.String())
 	}
+
+	// The standalone listener must expose /logs and nothing else.
+	h := g.logsHandler()
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/logs?token=sekret", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("logsHandler /logs code = %d, want 200", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/users/alice", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("logsHandler /users code = %d, want 404 (only /logs is served)", rec.Code)
+	}
 }
 
 // Every outbound fetch a request fans out to must be logged under one trace id,
