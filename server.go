@@ -721,6 +721,35 @@ func (g *gateway) apGetJSON(ctx context.Context, rawURL, accept string) (map[str
 	return m, nil
 }
 
+// apGetArray is apGetJSON for endpoints that return a top-level JSON array (the
+// Mastodon REST list endpoints, e.g. an account's statuses).
+func (g *gateway) apGetArray(ctx context.Context, rawURL, accept string) ([]any, error) {
+	if !g.allowPrivateTargets {
+		if err := validateRemoteURL(rawURL); err != nil {
+			return nil, err
+		}
+	}
+	status, bt, _, err := g.sendRetry(ctx, func() (*http.Request, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if rerr != nil {
+			return nil, rerr
+		}
+		req.Header.Set("Accept", accept)
+		return req, g.signGet(req)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s: %w", rawURL, err)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("fetch %s: status %d: %w", rawURL, status, errRemoteStatus)
+	}
+	var a []any
+	if err := json.Unmarshal(bt, &a); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
 // fetchMedia downloads a remote media URL (SSRF-guarded), returning its
 // content type and bytes.
 func (g *gateway) fetchMedia(ctx context.Context, rawURL string) (string, []byte, error) {

@@ -1035,6 +1035,112 @@ func TestGetRepliesUsesMastodonContext(t *testing.T) {
 	}
 }
 
+// GetTweets must load the timeline from the Mastodon REST statuses endpoint in
+// one page, unwrapping boosts and embedding media, and page by max_id.
+func TestGetTweetsUsesMastodonREST(t *testing.T) {
+	g := testGateway(t)
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/lookup":
+			writeJSON(w, "application/json", map[string]any{"id": "42", "acct": "alice"})
+		case "/api/v1/accounts/42/statuses":
+			writeJSON(w, "application/json", []any{
+				map[string]any{
+					"id": "100", "uri": srv.URL + "/users/alice/statuses/100",
+					"content": "<p>hello</p>", "created_at": "2024-01-01T00:00:00.000Z",
+					"account":           map[string]any{"acct": "alice"},
+					"media_attachments": []any{map[string]any{"type": "image", "url": srv.URL + "/img.png"}},
+				},
+				map[string]any{
+					"id": "101", "uri": srv.URL + "/users/alice/statuses/101",
+					"content": "", "created_at": "2024-01-01T00:01:00.000Z",
+					"account": map[string]any{"acct": "alice"},
+					"reblog": map[string]any{
+						"id": "200", "uri": srv.URL + "/users/bob/statuses/200",
+						"content": "<p>boosted</p>", "created_at": "2024-01-01T00:02:00.000Z",
+						"account": map[string]any{"acct": "bob@other.example"},
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r) // no webfinger/outbox: only the REST path must be used
+		}
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+	host := strings.TrimPrefix(srv.URL, "https://")
+
+	b := newMastodonBridge(g, "node1")
+	resp, err := b.GetTweets(context.Background(), "alice@"+host, nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(resp.Tweets) != 2 {
+		t.Fatalf("tweets = %d, want 2: %+v", len(resp.Tweets), resp.Tweets)
+	}
+	t0 := resp.Tweets[0]
+	if t0.Id != srv.URL+"/users/alice/statuses/100" || t0.RootId != t0.Id {
+		t.Errorf("t0 id/root = %q/%q, want top-level 100", t0.Id, t0.RootId)
+	}
+	if len(t0.ImageKeys) != 1 || t0.ImageKeys[0] != srv.URL+"/img.png" {
+		t.Errorf("t0.ImageKeys = %v, want the media url", t0.ImageKeys)
+	}
+	t1 := resp.Tweets[1]
+	if t1.Id != srv.URL+"/users/bob/statuses/200" { // boost unwrapped to the boosted status
+		t.Errorf("t1.Id = %q, want boosted 200", t1.Id)
+	}
+	if t1.RetweetedBy == nil || *t1.RetweetedBy != "alice@"+host {
+		t.Errorf("t1.RetweetedBy = %v, want alice@%s", t1.RetweetedBy, host)
+	}
+	if t1.UserId != "bob@other.example" {
+		t.Errorf("t1.UserId = %q, want the boosted author", t1.UserId)
+	}
+	if !strings.Contains(resp.Cursor, "max_id=101") {
+		t.Errorf("cursor = %q, want max_id=101", resp.Cursor)
+	}
+}
+
+// GetTweet and GetTweetStats must read a single status (and its real counts)
+// from the Mastodon REST status endpoint.
+func TestGetTweetAndStatsUseMastodonREST(t *testing.T) {
+	g := testGateway(t)
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/statuses/100" {
+			writeJSON(w, "application/json", map[string]any{
+				"id": "100", "uri": srv.URL + "/users/alice/statuses/100",
+				"content": "<p>hi</p>", "created_at": "2024-01-01T00:00:00.000Z",
+				"account":       map[string]any{"acct": "alice"},
+				"replies_count": float64(3), "reblogs_count": float64(2), "favourites_count": float64(5),
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+	host := strings.TrimPrefix(srv.URL, "https://")
+	b := newMastodonBridge(g, "node1")
+	noteURL := srv.URL + "/users/alice/statuses/100"
+
+	tw, err := b.GetTweet(context.Background(), noteURL)
+	if err != nil {
+		t.Fatalf("GetTweet err: %v", err)
+	}
+	if tw.Id != noteURL || tw.Text != "hi" || tw.UserId != "alice@"+host {
+		t.Errorf("tweet = %+v, want mapped REST status", tw)
+	}
+
+	stats, err := b.GetTweetStats(context.Background(), noteURL)
+	if err != nil {
+		t.Fatalf("GetTweetStats err: %v", err)
+	}
+	if stats.LikeCount != 5 || stats.RetweetsCount != 2 || stats.RepliesCount != 3 {
+		t.Errorf("stats = %+v, want likes=5 boosts=2 replies=3", stats)
+	}
+}
+
 // Warpnet paginates GET_TWEETS with the requesting node's own datastore cursor
 // (e.g. "/TWEETS/<user>/<seq>/<noteURL>"), not the AP "next" URL the gateway
 // returned. The gateway must ignore such a cursor and serve the first outbox

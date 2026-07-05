@@ -52,6 +52,7 @@ import (
 // implements it (reusing its SSRF-hardened client and signing keys).
 type apTransport interface {
 	apGetJSON(ctx context.Context, rawURL, accept string) (map[string]any, error)
+	apGetArray(ctx context.Context, rawURL, accept string) ([]any, error)
 	fetchActor(ctx context.Context, actorURL string) (map[string]any, error)
 	remoteInbox(ctx context.Context, actorURL string) (string, error)
 	actorID(user string) string
@@ -161,9 +162,88 @@ func pageCursor(cursor *string) string {
 	return *cursor
 }
 
-// GetTweets renders a remote actor's outbox as Warpnet tweets. cursor, when set,
-// is the next OrderedCollectionPage URL.
+// GetTweets renders a remote actor's timeline as Warpnet tweets. Mastodon-family
+// instances serve a full status page (counts, boosts, media inline) from one
+// REST call, avoiding the per-item dereferences the AP outbox needs; others fall
+// back to the outbox. cursor, when set, continues whichever source produced it.
 func (b *mastodonBridge) GetTweets(ctx context.Context, handle string, cursor *string) (tweetsResponse, error) {
+	if pc := pageCursor(cursor); pc != "" {
+		if isRESTStatusesURL(pc) {
+			resp, _ := b.restTweetsPage(ctx, handle, pc)
+			return resp, nil
+		}
+		return b.apTweets(ctx, handle, cursor)
+	}
+	if resp, ok := b.restTweets(ctx, handle); ok {
+		return resp, nil
+	}
+	return b.apTweets(ctx, handle, cursor)
+}
+
+// isRESTStatusesURL reports whether a pagination cursor points at the Mastodon
+// REST account-statuses endpoint (so pagination continues on the REST path).
+func isRESTStatusesURL(u string) bool {
+	return strings.Contains(u, "/api/v1/accounts/") && strings.Contains(u, "/statuses")
+}
+
+// restTweets loads a handle's first status page over the Mastodon REST API,
+// resolving the account id via /accounts/lookup. ok is false for non-Mastodon
+// instances, so the caller falls back to the AP outbox.
+func (b *mastodonBridge) restTweets(ctx context.Context, handle string) (tweetsResponse, bool) {
+	name, instance, ok := strings.Cut(strings.TrimPrefix(handle, "@"), "@")
+	if !ok || name == "" || instance == "" {
+		return tweetsResponse{}, false
+	}
+	look, err := b.ap.apGetJSON(ctx, "https://"+instance+"/api/v1/accounts/lookup?acct="+url.QueryEscape(name+"@"+instance), "application/json")
+	if err != nil {
+		return tweetsResponse{}, false
+	}
+	accID := asString(look["id"])
+	if accID == "" {
+		return tweetsResponse{}, false
+	}
+	return b.restTweetsPage(ctx, handle, "https://"+instance+"/api/v1/accounts/"+accID+"/statuses?limit=40")
+}
+
+// restTweetsPage fetches one REST status page and maps it, deriving the next
+// cursor from the last status id (Mastodon paginates by max_id).
+func (b *mastodonBridge) restTweetsPage(ctx context.Context, handle, pageURL string) (tweetsResponse, bool) {
+	arr, err := b.ap.apGetArray(ctx, pageURL, "application/json")
+	if err != nil {
+		return tweetsResponse{UserId: handle}, false
+	}
+	host := ""
+	if u, perr := url.Parse(pageURL); perr == nil {
+		host = u.Host
+	}
+	resp := tweetsResponse{UserId: handle}
+	lastID := ""
+	for _, it := range arr {
+		s := asMap(it)
+		if s == nil {
+			continue
+		}
+		if sid := asString(s["id"]); sid != "" {
+			lastID = sid
+		}
+		if t, ok := restStatusToTweet(host, s); ok {
+			resp.Tweets = append(resp.Tweets, t)
+		}
+	}
+	if lastID != "" && len(arr) > 0 {
+		if u, perr := url.Parse(pageURL); perr == nil {
+			q := u.Query()
+			q.Set("max_id", lastID)
+			u.RawQuery = q.Encode()
+			resp.Cursor = u.String()
+		}
+	}
+	return resp, true
+}
+
+// apTweets renders a remote actor's outbox as Warpnet tweets (fallback). cursor,
+// when set, is the next OrderedCollectionPage URL.
+func (b *mastodonBridge) apTweets(ctx context.Context, handle string, cursor *string) (tweetsResponse, error) {
 	pageURL := pageCursor(cursor)
 	if pageURL == "" {
 		actorURL, err := b.resolveHandle(ctx, handle)
@@ -282,9 +362,24 @@ func (b *mastodonBridge) fillQuotedAuthor(ctx context.Context, t *tweet) {
 	}
 }
 
-// GetTweet fetches a single Note by its id (the AP object URL stored as tweet id).
+// GetTweet fetches a single status by its id. Mastodon-family instances serve
+// the full status (counts, boost, media inline) from one REST call; others fall
+// back to dereferencing the AP Note.
 func (b *mastodonBridge) GetTweet(ctx context.Context, noteURL string) (tweet, error) {
-	m, err := b.ap.apGetJSON(ctx, strings.TrimPrefix(noteURL, domain.RetweetPrefix), contentTypeAP)
+	noteURL = strings.TrimPrefix(noteURL, domain.RetweetPrefix)
+	if host, id, ok := restStatusRef(noteURL); ok {
+		if m, err := b.ap.apGetJSON(ctx, "https://"+host+"/api/v1/statuses/"+id, "application/json"); err == nil {
+			if t, ok := restStatusToTweet(host, m); ok {
+				return t, nil
+			}
+		}
+	}
+	return b.apTweet(ctx, noteURL)
+}
+
+// apTweet dereferences a single AP Note (fallback for non-Mastodon instances).
+func (b *mastodonBridge) apTweet(ctx context.Context, noteURL string) (tweet, error) {
+	m, err := b.ap.apGetJSON(ctx, noteURL, contentTypeAP)
 	if err != nil {
 		return tweet{}, err
 	}
@@ -319,15 +414,11 @@ const maxReplies = 50
 // and flattens its descendants into replies. ok is false when the instance is
 // not Mastodon-compatible (no /context), so the caller falls back to AP.
 func (b *mastodonBridge) contextReplies(ctx context.Context, noteURL string) (repliesResponse, bool) {
-	u, err := url.Parse(noteURL)
-	if err != nil || u.Host == "" {
+	host, id, ok := restStatusRef(noteURL)
+	if !ok {
 		return repliesResponse{}, false
 	}
-	id := path.Base(strings.TrimRight(u.Path, "/"))
-	if id == "" || id == "." || id == "/" {
-		return repliesResponse{}, false
-	}
-	ctxURL := u.Scheme + "://" + u.Host + "/api/v1/statuses/" + id + "/context"
+	ctxURL := "https://" + host + "/api/v1/statuses/" + id + "/context"
 	m, err := b.ap.apGetJSON(ctx, ctxURL, "application/json")
 	if err != nil {
 		return repliesResponse{}, false // not Mastodon / not reachable -> AP fallback
@@ -353,18 +444,41 @@ func (b *mastodonBridge) contextReplies(ctx context.Context, noteURL string) (re
 		if len(resp.Replies) >= maxReplies {
 			break
 		}
-		if t, ok := restStatusToTweet(u.Host, asMap(it), noteURL, idToURI); ok {
+		if t, ok := restReplyToTweet(host, asMap(it), noteURL, idToURI); ok {
 			resp.Replies = append(resp.Replies, domain.ReplyNode{Reply: t})
 		}
 	}
 	return resp, true
 }
 
-// restStatusToTweet maps a Mastodon REST status (distinct from an AP Note) to a
-// tweet. host is the instance the status was fetched from, used to complete a
-// local account's bare acct into a name@host handle; rootURL is the thread root
-// and idToURI resolves in_reply_to_id to the parent's AP note URL.
-func restStatusToTweet(host string, s map[string]any, rootURL string, idToURI map[string]string) (tweet, bool) {
+// restStatusRef splits an AP note/status URL into the instance host and the
+// status id (its last path segment) for building Mastodon REST URLs. ok is false
+// for URLs without a host or id.
+func restStatusRef(noteURL string) (host, id string, ok bool) {
+	u, err := url.Parse(noteURL)
+	if err != nil || u.Host == "" {
+		return "", "", false
+	}
+	id = path.Base(strings.TrimRight(u.Path, "/"))
+	if id == "" || id == "." || id == "/" {
+		return "", "", false
+	}
+	return u.Host, id, true
+}
+
+// acctHandle completes a REST account's bare acct (local accounts) into a
+// name@host handle; remote accounts already carry the @host.
+func acctHandle(host, acct string) string {
+	if acct == "" || strings.Contains(acct, "@") {
+		return acct
+	}
+	return acct + "@" + host
+}
+
+// restBaseTweet maps the fields common to every Mastodon REST status (distinct
+// from an AP Note) into a tweet, defaulting to the top-level convention
+// (RootId = own id, no ParentId). host completes a local account's handle.
+func restBaseTweet(host string, s map[string]any) (tweet, bool) {
 	if s == nil {
 		return tweet{}, false
 	}
@@ -375,26 +489,16 @@ func restStatusToTweet(host string, s map[string]any, rootURL string, idToURI ma
 	if uri == "" {
 		return tweet{}, false
 	}
-	acct := asString(asMap(s["account"])["acct"])
-	if acct != "" && !strings.Contains(acct, "@") {
-		acct += "@" + host // local account: acct is bare, make it a full handle
-	}
+	handle := acctHandle(host, asString(asMap(s["account"])["acct"]))
 	t := tweet{
 		Id:        uri,
-		RootId:    rootURL,
+		RootId:    uri,
 		Text:      htmlToText(asString(s["content"])),
-		UserId:    acct,
-		Username:  acct,
+		UserId:    handle,
+		Username:  handle,
 		CreatedAt: parseAPTime(asString(s["created_at"])),
 		Network:   mastodonNetwork,
 	}
-	parent := rootURL
-	if irid := asString(s["in_reply_to_id"]); irid != "" {
-		if puri, ok := idToURI[irid]; ok {
-			parent = puri
-		}
-	}
-	t.ParentId = &parent
 	for _, a := range asSlice(s["media_attachments"]) {
 		att := asMap(a)
 		if att == nil || asString(att["type"]) != "image" {
@@ -404,9 +508,54 @@ func restStatusToTweet(host string, s map[string]any, rootURL string, idToURI ma
 			t.ImageKeys = append(t.ImageKeys, mu)
 		}
 	}
+	if q := asMap(s["quote"]); q != nil {
+		if qu := asString(q["uri"]); qu != "" {
+			t.QuotedTweetId = &qu
+			if qh := acctHandle(host, asString(asMap(q["account"])["acct"])); qh != "" {
+				t.QuotedUserId = &qh
+			}
+		}
+	}
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now()
 	}
+	return t, true
+}
+
+// restStatusToTweet maps a standalone REST status (timeline / single tweet),
+// unwrapping a boost into the boosted status stamped with RetweetedBy.
+func restStatusToTweet(host string, s map[string]any) (tweet, bool) {
+	if s == nil {
+		return tweet{}, false
+	}
+	if rb := asMap(s["reblog"]); rb != nil {
+		t, ok := restStatusToTweet(host, rb)
+		if !ok {
+			return tweet{}, false
+		}
+		if by := acctHandle(host, asString(asMap(s["account"])["acct"])); by != "" {
+			t.RetweetedBy = &by
+		}
+		return t, true
+	}
+	return restBaseTweet(host, s)
+}
+
+// restReplyToTweet maps a REST status that is a reply: it points RootId at the
+// thread root and resolves in_reply_to_id to the parent's AP note URL via idToURI.
+func restReplyToTweet(host string, s map[string]any, rootURL string, idToURI map[string]string) (tweet, bool) {
+	t, ok := restBaseTweet(host, s)
+	if !ok {
+		return tweet{}, false
+	}
+	t.RootId = rootURL
+	parent := rootURL
+	if irid := asString(s["in_reply_to_id"]); irid != "" {
+		if puri, has := idToURI[irid]; has {
+			parent = puri
+		}
+	}
+	t.ParentId = &parent
 	return t, true
 }
 
@@ -502,9 +651,24 @@ func (b *mastodonBridge) resolveReplyItems(ctx context.Context, items []any) []d
 	return replies
 }
 
-// GetTweetStats reads the like/boost/reply counts off the Note.
+// GetTweetStats reads the like/boost/reply counts for a status. Mastodon's REST
+// status carries them directly (favourites_count/reblogs_count/replies_count) —
+// which the AP Note does not federate (likes/shares are usually absent, so the
+// AP path reports 0) — so prefer REST and fall back to the AP collections.
 func (b *mastodonBridge) GetTweetStats(ctx context.Context, noteURL string) (event.TweetStatsResponse, error) {
 	noteURL = strings.TrimPrefix(noteURL, domain.RetweetPrefix)
+	if host, id, ok := restStatusRef(noteURL); ok {
+		if m, err := b.ap.apGetJSON(ctx, "https://"+host+"/api/v1/statuses/"+id, "application/json"); err == nil {
+			if _, isStatus := m["replies_count"]; isStatus {
+				return event.TweetStatsResponse{
+					TweetId:       domain.ID(noteURL),
+					LikeCount:     numField(m["favourites_count"]),
+					RetweetsCount: numField(m["reblogs_count"]),
+					RepliesCount:  numField(m["replies_count"]),
+				}, nil
+			}
+		}
+	}
 	m, err := b.ap.apGetJSON(ctx, noteURL, contentTypeAP)
 	if err != nil {
 		return event.TweetStatsResponse{}, err
@@ -518,6 +682,14 @@ func (b *mastodonBridge) GetTweetStats(ctx context.Context, noteURL string) (eve
 		RetweetsCount: apCollectionCount(m["shares"]),
 		RepliesCount:  apCollectionCount(m["replies"]),
 	}, nil
+}
+
+// numField reads a JSON number (Mastodon REST count) as a uint64; 0 otherwise.
+func numField(v any) uint64 {
+	if f, ok := v.(float64); ok && f > 0 {
+		return uint64(f)
+	}
+	return 0
 }
 
 func (b *mastodonBridge) GetFollowers(ctx context.Context, handle string, cursor *string) (followersResponse, error) {
