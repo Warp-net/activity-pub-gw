@@ -59,11 +59,12 @@ import (
 	"time"
 
 	"github.com/Warp-net/warpnet/retrier"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	log "github.com/sirupsen/logrus"
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.57"
+const gatewayVersion = "0.1.58"
 
 const fatalFmt = "gateway: %v"
 
@@ -144,7 +145,8 @@ func main() {
 		req:       req,
 		// Retry transient Mastodon HTTP failures (network errors, 429, 5xx) a few
 		// times with exponential backoff; bounded so it stays within the request budget.
-		retrier: retrier.New(300*time.Millisecond, 3, retrier.ExponentialBackoff),
+		retrier:  retrier.New(300*time.Millisecond, 3, retrier.ExponentialBackoff),
+		getCache: expirable.NewLRU[string, cachedGet](getCacheSize, nil, getCacheTTL),
 	}
 
 	// Serve Warpnet's public /public routes over libp2p (Mastodon -> Warpnet):

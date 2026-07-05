@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Warp-net/warpnet/retrier"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
 func testGateway(t *testing.T) *gateway {
@@ -1138,6 +1139,43 @@ func TestGetTweetAndStatsUseMastodonREST(t *testing.T) {
 	}
 	if stats.LikeCount != 5 || stats.RetweetsCount != 2 || stats.RepliesCount != 3 {
 		t.Errorf("stats = %+v, want likes=5 boosts=2 replies=3", stats)
+	}
+}
+
+// The short-TTL GET cache must collapse repeated fetches of the same URL (the
+// burst a timeline render triggers) onto a single network round-trip.
+func TestSignedGetCacheDedupes(t *testing.T) {
+	g := testGateway(t)
+	g.getCache = expirable.NewLRU[string, cachedGet](getCacheSize, nil, getCacheTTL)
+	var hits int32
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/statuses/100" {
+			atomic.AddInt32(&hits, 1)
+			writeJSON(w, "application/json", map[string]any{
+				"id": "100", "uri": srv.URL + "/users/alice/statuses/100",
+				"content": "<p>hi</p>", "account": map[string]any{"acct": "alice"},
+				"replies_count": float64(1), "reblogs_count": float64(0), "favourites_count": float64(0),
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+	b := newMastodonBridge(g, "node1")
+	noteURL := srv.URL + "/users/alice/statuses/100"
+
+	for i := 0; i < 3; i++ {
+		if _, err := b.GetTweet(context.Background(), noteURL); err != nil {
+			t.Fatalf("GetTweet %d: %v", i, err)
+		}
+	}
+	if _, err := b.GetTweetStats(context.Background(), noteURL); err != nil {
+		t.Fatalf("GetTweetStats: %v", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("origin hits = %d, want 1 (cache should dedupe)", got)
 	}
 }
 

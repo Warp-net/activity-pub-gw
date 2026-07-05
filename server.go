@@ -46,6 +46,7 @@ import (
 	"time"
 
 	"github.com/Warp-net/warpnet/retrier"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -106,10 +107,28 @@ type gateway struct {
 	onFollowed func(localUser string) // starts outbound federation for a user; nil without a node
 	limits     *rateLimiters          // weighted per-IP + global rate limiting; built lazily by routes()
 
+	// getCache deduplicates outbound signed GETs for a very short window so the
+	// burst of per-tweet/per-actor fetches a single timeline render triggers
+	// collapses onto one round-trip. Transient, in memory, 1s TTL — not storage.
+	getCache *expirable.LRU[string, cachedGet]
+
 	// allowPrivateTargets disables the SSRF guard's loopback/private-range
 	// rejection for outbound delivery. Test-only; never set in main.go.
 	allowPrivateTargets bool
 }
+
+// cachedGet is a memoized signed-GET response (final, non-retryable).
+type cachedGet struct {
+	status int
+	body   []byte
+}
+
+const (
+	// getCacheTTL is intentionally tiny: it only collapses the fan-out of a
+	// single request burst, never serves stale data across user actions.
+	getCacheTTL  = time.Second
+	getCacheSize = 2048
+)
 
 func (g *gateway) baseURL() string            { return "https://" + g.host }
 func (g *gateway) actorID(user string) string { return g.baseURL() + pathUsers + user }
@@ -619,6 +638,33 @@ func (g *gateway) sendRetry(ctx context.Context, newReq func() (*http.Request, e
 	return status, body, header, g.retrier.Try(ctx, do)
 }
 
+// signedGet issues a signed GET, memoizing the final response in getCache for a
+// 1s window keyed by accept+URL. The body is returned to each caller for its own
+// unmarshal, so the shared cache never hands out a mutable decoded document.
+func (g *gateway) signedGet(ctx context.Context, rawURL, accept string) (int, []byte, error) {
+	key := accept + " " + rawURL
+	if g.getCache != nil {
+		if c, ok := g.getCache.Get(key); ok {
+			return c.status, c.body, nil
+		}
+	}
+	status, bt, _, err := g.sendRetry(ctx, func() (*http.Request, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if rerr != nil {
+			return nil, rerr
+		}
+		req.Header.Set("Accept", accept)
+		return req, g.signGet(req)
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	if g.getCache != nil {
+		g.getCache.Add(key, cachedGet{status: status, body: bt})
+	}
+	return status, bt, nil
+}
+
 func (g *gateway) fetchActor(ctx context.Context, actorURL string) (map[string]any, error) {
 	if !g.allowPrivateTargets {
 		if err := validateRemoteURL(actorURL); err != nil {
@@ -628,14 +674,7 @@ func (g *gateway) fetchActor(ctx context.Context, actorURL string) (map[string]a
 	// G704: dereferencing remote actor URLs is intrinsic to ActivityPub
 	// federation; validateRemoteURL enforces https, full SSRF hardening is a
 	// documented production TODO.
-	status, bt, _, err := g.sendRetry(ctx, func() (*http.Request, error) {
-		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, actorURL, nil)
-		if rerr != nil {
-			return nil, rerr
-		}
-		req.Header.Set("Accept", contentTypeAP)
-		return req, g.signGet(req)
-	})
+	status, bt, err := g.signedGet(ctx, actorURL, contentTypeAP)
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", actorURL, err)
 	}
@@ -700,14 +739,7 @@ func (g *gateway) apGetJSON(ctx context.Context, rawURL, accept string) (map[str
 			return nil, err
 		}
 	}
-	status, bt, _, err := g.sendRetry(ctx, func() (*http.Request, error) {
-		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-		if rerr != nil {
-			return nil, rerr
-		}
-		req.Header.Set("Accept", accept)
-		return req, g.signGet(req)
-	})
+	status, bt, err := g.signedGet(ctx, rawURL, accept)
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", rawURL, err)
 	}
@@ -729,14 +761,7 @@ func (g *gateway) apGetArray(ctx context.Context, rawURL, accept string) ([]any,
 			return nil, err
 		}
 	}
-	status, bt, _, err := g.sendRetry(ctx, func() (*http.Request, error) {
-		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-		if rerr != nil {
-			return nil, rerr
-		}
-		req.Header.Set("Accept", accept)
-		return req, g.signGet(req)
-	})
+	status, bt, err := g.signedGet(ctx, rawURL, accept)
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", rawURL, err)
 	}
