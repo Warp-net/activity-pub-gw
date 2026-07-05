@@ -175,7 +175,13 @@ func (c *nodeClient) streamHandler(route string, h routeHandler) network.StreamH
 
 		ctx, cancel := context.WithTimeout(context.Background(), apRequestTimeout)
 		defer cancel()
+		// Trace the whole pipeline: every outbound REST/AP fetch this libp2p
+		// request fans out to is logged indented under one id, then the summary
+		// line below reports the fetch count and total wall-clock.
+		ctx, tr := startTrace(ctx)
+		start := time.Now()
 		resp, herr := h(ctx, msg.Body)
+		log.Infof("[%s] libp2p %s: %d REST calls in %s", tr.id, route, tr.calls.Load(), time.Since(start).Round(time.Millisecond))
 		if herr != nil {
 			log.Warnf("nodeserver: %s: %v", route, herr)
 			resp = event.ResponseError{Message: herr.Error()}

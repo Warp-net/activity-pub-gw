@@ -645,9 +645,11 @@ func (g *gateway) signedGet(ctx context.Context, rawURL, accept string) (int, []
 	key := accept + " " + rawURL
 	if g.getCache != nil {
 		if c, ok := g.getCache.Get(key); ok {
+			logFetch(ctx, "GET", rawURL, c.status, 0, true)
 			return c.status, c.body, nil
 		}
 	}
+	start := time.Now()
 	status, bt, _, err := g.sendRetry(ctx, func() (*http.Request, error) {
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if rerr != nil {
@@ -657,8 +659,10 @@ func (g *gateway) signedGet(ctx context.Context, rawURL, accept string) (int, []
 		return req, g.signGet(req)
 	})
 	if err != nil {
+		logFetch(ctx, "GET", rawURL, 0, time.Since(start), false)
 		return 0, nil, err
 	}
+	logFetch(ctx, "GET", rawURL, status, time.Since(start), false)
 	if g.getCache != nil {
 		g.getCache.Add(key, cachedGet{status: status, body: bt})
 	}
@@ -783,6 +787,7 @@ func (g *gateway) fetchMedia(ctx context.Context, rawURL string) (string, []byte
 			return "", nil, err
 		}
 	}
+	start := time.Now()
 	status, bt, header, err := g.sendRetry(ctx, func() (*http.Request, error) {
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if rerr != nil {
@@ -790,6 +795,7 @@ func (g *gateway) fetchMedia(ctx context.Context, rawURL string) (string, []byte
 		}
 		return req, g.signGet(req)
 	})
+	logFetch(ctx, "GET media", rawURL, status, time.Since(start), false)
 	if err != nil {
 		return "", nil, fmt.Errorf("media %s: %w", rawURL, err)
 	}
