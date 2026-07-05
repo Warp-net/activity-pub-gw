@@ -311,10 +311,32 @@ func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (replie
 		if len(items) == 0 {
 			items = asSlice(page["orderedItems"]) // Mastodon uses items; others orderedItems
 		}
-		for _, it := range items {
-			if len(resp.Replies) >= maxReplies {
-				break
-			}
+		if room := maxReplies - len(resp.Replies); len(items) > room {
+			items = items[:room] // never dereference more than we can keep
+		}
+		resp.Replies = append(resp.Replies, b.resolveReplyItems(ctx, items)...)
+		pageURL = asString(page["next"])
+		page = nil
+	}
+	return resp, nil
+}
+
+// resolveReplyItems dereferences one reply page's items concurrently, preserving
+// order. Each item is usually a note URI needing its own fetch (plus a possible
+// quoted-author fetch), so a long thread would otherwise serialize dozens of
+// round-trips; a bounded pool keeps the fan-out gentle on the remote instance.
+func (b *mastodonBridge) resolveReplyItems(ctx context.Context, items []any) []domain.ReplyNode {
+	const maxConcurrent = 8
+	out := make([]tweet, len(items))
+	ok := make([]bool, len(items))
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	for i, it := range items {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
 			note := asMap(it)
 			if note == nil {
 				// item is a note URI (Mastodon's usual form) — dereference it.
@@ -323,17 +345,22 @@ func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (replie
 				}
 			}
 			if note == nil {
-				continue
+				return
 			}
-			if t, ok := noteToTweet(handleFromActorURL(asString(note["attributedTo"])), note); ok {
+			if t, good := noteToTweet(handleFromActorURL(asString(note["attributedTo"])), note); good {
 				b.fillQuotedAuthor(ctx, &t)
-				resp.Replies = append(resp.Replies, domain.ReplyNode{Reply: t})
+				out[i], ok[i] = t, true
 			}
-		}
-		pageURL = asString(page["next"])
-		page = nil
+		}()
 	}
-	return resp, nil
+	wg.Wait()
+	replies := make([]domain.ReplyNode, 0, len(items))
+	for i := range items {
+		if ok[i] {
+			replies = append(replies, domain.ReplyNode{Reply: out[i]})
+		}
+	}
+	return replies
 }
 
 // GetTweetStats reads the like/boost/reply counts off the Note.
