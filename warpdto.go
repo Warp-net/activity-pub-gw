@@ -83,3 +83,14 @@ type (
 	getImageEvent      = event.GetImageEvent
 	getImageResponse   = event.GetImageResponse
 )
+
+// getTweetsRequest is the PUBLIC_GET_TWEETS body. Warpnet folded thread replies
+// into this route (a profile request carries only user_id; a thread-replies
+// request carries root_id/parent_id), but the pinned event.GetAllTweetsEvent
+// predates the reply fields, so decode them here to dispatch on them.
+type getTweetsRequest struct {
+	UserId   string  `json:"user_id"`
+	RootId   string  `json:"root_id"`
+	ParentId string  `json:"parent_id"`
+	Cursor   *string `json:"cursor,omitempty"`
+}

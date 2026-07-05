@@ -80,8 +80,8 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 			}
 			return event.UsersResponse{Users: []user{u}}, nil
 		}),
-		routeGetTweets: wrapJSON(func(ctx context.Context, ev getAllTweetsEvent) (any, error) {
-			return b.GetTweets(ctx, string(ev.UserId), ev.Cursor)
+		routeGetTweets: wrapJSON(func(ctx context.Context, ev getTweetsRequest) (any, error) {
+			return b.GetTweetsOrReplies(ctx, ev)
 		}),
 		routeGetTweet: wrapJSON(func(ctx context.Context, ev getTweetEvent) (any, error) {
 			return b.GetTweet(ctx, string(ev.TweetId))
