@@ -194,6 +194,14 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+// logsHandler is the handler for the optional standalone /logs listener
+// (GATEWAY_LOGS_ADDR): it exposes only /logs, never the federation surface.
+func (g *gateway) logsHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/logs", g.handleLogs)
+	return mux
+}
+
 // handleLogs serves the in-memory log ring as text/plain. It is gated by
 // GATEWAY_LOGS_TOKEN (supplied as ?token= or a Bearer header): the endpoint is
 // disabled (404) unless a token is configured, so the Funnel-exposed gateway

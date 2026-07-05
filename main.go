@@ -64,7 +64,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.60"
+const gatewayVersion = "0.1.62"
 
 // logRingSize is how many recent log lines the /logs endpoint retains in memory.
 const logRingSize = 2000
@@ -194,6 +194,20 @@ func main() {
 		}
 	}()
 
+	// Optional standalone /logs listener on a plain-HTTP port (e.g. ":8080"),
+	// for reaching the logs on the host's own address instead of the Funnel
+	// hostname. Serves only /logs and stays gated by GATEWAY_LOGS_TOKEN.
+	var logsSrv *http.Server
+	if addr := os.Getenv("GATEWAY_LOGS_ADDR"); addr != "" {
+		logsSrv = &http.Server{Addr: addr, Handler: g.logsHandler(), ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			log.Infof("gateway: serving /logs on %s", addr)
+			if err := logsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Errorf("gateway: logs listener: %v", err)
+			}
+		}()
+	}
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
@@ -206,6 +220,9 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+	if logsSrv != nil {
+		_ = logsSrv.Shutdown(ctx)
+	}
 	_ = ts.Close()
 }
 
