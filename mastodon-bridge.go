@@ -38,6 +38,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -296,10 +298,123 @@ func (b *mastodonBridge) GetTweet(ctx context.Context, noteURL string) (tweet, e
 	return t, nil
 }
 
-// GetReplies reads a Note's replies collection, walking a bounded number of
-// pages and dereferencing items that are note URIs.
+// GetReplies returns a flat list of a Note's replies. Mastodon-family instances
+// expose the whole thread via one REST call (/api/v1/statuses/{id}/context), so
+// try that first — it is a single unauthenticated request that returns every
+// descendant as a full status, instead of dereferencing each reply URI from the
+// slow, often-partial ActivityPub replies collection. Non-Mastodon servers
+// (no /context) fall back to the AP walk.
 func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (repliesResponse, error) {
-	m, err := b.ap.apGetJSON(ctx, strings.TrimPrefix(noteURL, domain.RetweetPrefix), contentTypeAP)
+	noteURL = strings.TrimPrefix(noteURL, domain.RetweetPrefix)
+	if resp, ok := b.contextReplies(ctx, noteURL); ok {
+		return resp, nil
+	}
+	return b.apReplies(ctx, noteURL)
+}
+
+// maxReplies bounds how many replies GetReplies returns from either path.
+const maxReplies = 50
+
+// contextReplies fetches the whole thread via the Mastodon REST context endpoint
+// and flattens its descendants into replies. ok is false when the instance is
+// not Mastodon-compatible (no /context), so the caller falls back to AP.
+func (b *mastodonBridge) contextReplies(ctx context.Context, noteURL string) (repliesResponse, bool) {
+	u, err := url.Parse(noteURL)
+	if err != nil || u.Host == "" {
+		return repliesResponse{}, false
+	}
+	id := path.Base(strings.TrimRight(u.Path, "/"))
+	if id == "" || id == "." || id == "/" {
+		return repliesResponse{}, false
+	}
+	ctxURL := u.Scheme + "://" + u.Host + "/api/v1/statuses/" + id + "/context"
+	m, err := b.ap.apGetJSON(ctx, ctxURL, "application/json")
+	if err != nil {
+		return repliesResponse{}, false // not Mastodon / not reachable -> AP fallback
+	}
+	desc, hasDesc := m["descendants"]
+	if _, hasAnc := m["ancestors"]; !hasDesc && !hasAnc {
+		return repliesResponse{}, false // not a context document
+	}
+	items := asSlice(desc)
+	// Map each status's REST id to its ActivityPub uri so a reply's parent can be
+	// expressed as an AP note URL (the id the rest of the gateway speaks), with
+	// the requested note as the thread root.
+	idToURI := map[string]string{id: noteURL}
+	for _, it := range items {
+		if s := asMap(it); s != nil {
+			if sid, uri := asString(s["id"]), asString(s["uri"]); sid != "" && uri != "" {
+				idToURI[sid] = uri
+			}
+		}
+	}
+	resp := repliesResponse{Replies: []domain.ReplyNode{}}
+	for _, it := range items {
+		if len(resp.Replies) >= maxReplies {
+			break
+		}
+		if t, ok := restStatusToTweet(u.Host, asMap(it), noteURL, idToURI); ok {
+			resp.Replies = append(resp.Replies, domain.ReplyNode{Reply: t})
+		}
+	}
+	return resp, true
+}
+
+// restStatusToTweet maps a Mastodon REST status (distinct from an AP Note) to a
+// tweet. host is the instance the status was fetched from, used to complete a
+// local account's bare acct into a name@host handle; rootURL is the thread root
+// and idToURI resolves in_reply_to_id to the parent's AP note URL.
+func restStatusToTweet(host string, s map[string]any, rootURL string, idToURI map[string]string) (tweet, bool) {
+	if s == nil {
+		return tweet{}, false
+	}
+	uri := asString(s["uri"])
+	if uri == "" {
+		uri = asString(s["url"])
+	}
+	if uri == "" {
+		return tweet{}, false
+	}
+	acct := asString(asMap(s["account"])["acct"])
+	if acct != "" && !strings.Contains(acct, "@") {
+		acct += "@" + host // local account: acct is bare, make it a full handle
+	}
+	t := tweet{
+		Id:        uri,
+		RootId:    rootURL,
+		Text:      htmlToText(asString(s["content"])),
+		UserId:    acct,
+		Username:  acct,
+		CreatedAt: parseAPTime(asString(s["created_at"])),
+		Network:   mastodonNetwork,
+	}
+	parent := rootURL
+	if irid := asString(s["in_reply_to_id"]); irid != "" {
+		if puri, ok := idToURI[irid]; ok {
+			parent = puri
+		}
+	}
+	t.ParentId = &parent
+	for _, a := range asSlice(s["media_attachments"]) {
+		att := asMap(a)
+		if att == nil || asString(att["type"]) != "image" {
+			continue
+		}
+		if mu := asString(att["url"]); mu != "" {
+			t.ImageKeys = append(t.ImageKeys, mu)
+		}
+	}
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = time.Now()
+	}
+	return t, true
+}
+
+// apReplies reads a Note's replies collection over ActivityPub, walking a
+// bounded number of pages and dereferencing items that are note URIs. Used as
+// the fallback for instances without the Mastodon REST context endpoint.
+func (b *mastodonBridge) apReplies(ctx context.Context, noteURL string) (repliesResponse, error) {
+	m, err := b.ap.apGetJSON(ctx, noteURL, contentTypeAP)
 	if err != nil {
 		return repliesResponse{}, err
 	}
@@ -320,10 +435,7 @@ func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (replie
 	// Walk a bounded number of pages: Mastodon's replies collection lists items
 	// as note URIs (strings), so each is dereferenced; some servers inline the
 	// note objects instead. Bounded so a long thread can't run unbounded fetches.
-	const (
-		maxReplies = 20
-		maxPages   = 5
-	)
+	const maxPages = 5
 	for p := 0; p < maxPages && len(resp.Replies) < maxReplies; p++ {
 		if page == nil {
 			if pageURL == "" {

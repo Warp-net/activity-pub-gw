@@ -974,6 +974,67 @@ func TestGetRepliesDereferencesURIItems(t *testing.T) {
 	}
 }
 
+// GetReplies must prefer the Mastodon REST context endpoint, returning the whole
+// thread from one call and mapping REST statuses (not AP Notes) into replies.
+func TestGetRepliesUsesMastodonContext(t *testing.T) {
+	g := testGateway(t)
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/statuses/100/context" {
+			writeJSON(w, "application/json", map[string]any{
+				"ancestors": []any{},
+				"descendants": []any{
+					map[string]any{
+						"id": "101", "uri": srv.URL + "/users/bob/statuses/101",
+						"content": "<p>first reply</p>", "created_at": "2024-01-01T00:00:00.000Z",
+						"in_reply_to_id": "100", "account": map[string]any{"acct": "bob"},
+					},
+					map[string]any{
+						"id": "102", "uri": srv.URL + "/users/carol/statuses/102",
+						"content": "<p>nested</p>", "created_at": "2024-01-01T00:01:00.000Z",
+						"in_reply_to_id": "101", "account": map[string]any{"acct": "carol@other.example"},
+					},
+				},
+			})
+			return
+		}
+		http.NotFound(w, r) // no AP /replies route: only the context path must be used
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+	host := strings.TrimPrefix(srv.URL, "https://")
+
+	b := newMastodonBridge(g, "node1")
+	root := srv.URL + "/users/alice/statuses/100"
+	resp, err := b.GetReplies(context.Background(), root)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(resp.Replies) != 2 {
+		t.Fatalf("replies = %d, want 2: %+v", len(resp.Replies), resp.Replies)
+	}
+	r0 := resp.Replies[0].Reply
+	if r0.Id != srv.URL+"/users/bob/statuses/101" {
+		t.Errorf("r0.Id = %q, want the AP uri", r0.Id)
+	}
+	if r0.UserId != "bob@"+host { // local acct completed with the instance host
+		t.Errorf("r0.UserId = %q, want bob@%s", r0.UserId, host)
+	}
+	if r0.RootId != root {
+		t.Errorf("r0.RootId = %q, want %q", r0.RootId, root)
+	}
+	if r0.ParentId == nil || *r0.ParentId != root { // in_reply_to 100 -> root URL
+		t.Errorf("r0.ParentId = %v, want %q", r0.ParentId, root)
+	}
+	r1 := resp.Replies[1].Reply
+	if r1.UserId != "carol@other.example" { // already a full handle: keep as-is
+		t.Errorf("r1.UserId = %q, want carol@other.example", r1.UserId)
+	}
+	if r1.ParentId == nil || *r1.ParentId != srv.URL+"/users/bob/statuses/101" {
+		t.Errorf("r1.ParentId = %v, want bob's uri", r1.ParentId) // in_reply_to 101 -> bob
+	}
+}
+
 // Warpnet paginates GET_TWEETS with the requesting node's own datastore cursor
 // (e.g. "/TWEETS/<user>/<seq>/<noteURL>"), not the AP "next" URL the gateway
 // returned. The gateway must ignore such a cursor and serve the first outbox
