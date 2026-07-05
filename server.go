@@ -558,6 +558,11 @@ func newSafeClient(timeout time.Duration) *http.Client {
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.DialContext = dialer.DialContext
+	// A federation gateway talks to a handful of instances but fans many fetches
+	// at each (a thread pulls the note, its stats, every reply and their authors).
+	// The stdlib default keeps only 2 idle connections per host, so concurrent
+	// fetches force fresh TLS handshakes every batch; pool enough to reuse them.
+	tr.MaxIdleConnsPerHost = 32
 	return &http.Client{
 		Timeout:   timeout,
 		Transport: tr,
