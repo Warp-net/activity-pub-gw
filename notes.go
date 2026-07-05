@@ -55,6 +55,14 @@ func (g *gateway) buildNote(localUser string, t tweet) note {
 		To:           []string{asPublic},
 		Cc:           []string{followers},
 	}
+	// Link a reply back to the status it answers so Mastodon threads it into the
+	// conversation instead of showing a detached top-level post — without this a
+	// Warpnet reply loses all thread context on the Fediverse. The parent shares
+	// this author's status space for a self-thread; serveReplies overrides
+	// InReplyTo with the exact parent URL for a cross-author reply.
+	if parent := replyParentID(t); parent != "" {
+		n.InReplyTo = actorID + pathStatuses + parent
+	}
 	for _, key := range t.ImageKeys {
 		n.Attachment = append(n.Attachment, attachment{
 			Type: typeDocument,
@@ -62,6 +70,20 @@ func (g *gateway) buildNote(localUser string, t tweet) note {
 		})
 	}
 	return n
+}
+
+// replyParentID returns the id of the status a tweet replies to — its immediate
+// parent, or the thread root when the reply hangs directly off the root — or ""
+// for an original top-level post. It mirrors domain.Tweet's threading fields
+// (ParentId is the parent TWEET id, nil for top-level; RootId is the thread root).
+func replyParentID(t tweet) string {
+	if t.ParentId != nil && *t.ParentId != "" {
+		return *t.ParentId
+	}
+	if t.RootId != "" && t.RootId != t.Id {
+		return t.RootId
+	}
+	return ""
 }
 
 // buildCreateNote wraps a Warpnet tweet as an ActivityPub Create(Note) authored

@@ -518,13 +518,16 @@ func (g *gateway) serveReplies(w http.ResponseWriter, user, tweetID string) {
 		g.serveEmptyCollection(w, id)
 		return
 	}
+	parentURL := g.actorID(user) + pathStatuses + tweetID
 	items := make([]any, 0, len(resp.Replies))
 	for _, rn := range resp.Replies {
 		t := rn.Reply
 		if t.Id == "" || strings.HasPrefix(t.UserId, apFollowerPrefix) {
 			continue // skip fediverse-authored replies; Mastodon already has them
 		}
-		items = append(items, g.buildNote(t.UserId, t))
+		n := g.buildNote(t.UserId, t)
+		n.InReplyTo = parentURL // these are direct replies to (user, tweetID)
+		items = append(items, n)
 	}
 	writeJSON(w, contentTypeAP, orderedCollection{
 		Context:      asContext,
