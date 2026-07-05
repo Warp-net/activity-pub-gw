@@ -64,6 +64,23 @@ const (
 	ownerCacheTTL  = 10 * time.Minute
 )
 
+// Request timing. A route request used to share a single 1-minute budget across
+// a sequential walk of up to maxMemberCandidates peers, so one dead or slow node
+// stalled the whole request — that is what made AP HTTP requests hang for tens of
+// seconds. Now each attempt is individually bounded and candidates are hedged
+// (raced with a small stagger), so a stuck node costs at most hedgeDelay.
+const (
+	// requestTimeout bounds one whole route request end to end.
+	requestTimeout = 25 * time.Second
+	// perPeerTimeout bounds a single member attempt (DHT FindPeer + dial + round
+	// trip) so an unreachable node is abandoned quickly.
+	perPeerTimeout = 8 * time.Second
+	// hedgeDelay is how long to wait for the in-flight attempt(s) before racing
+	// the next candidate in parallel. The fast common case (the remembered-good
+	// node answers) still makes a single dial; a stalled primary is overtaken.
+	hedgeDelay = 2 * time.Second
+)
+
 // nodeClient joins the Warpnet DHT through the network's relays and streams the
 // /public/... routes to the member nodes it discovers via the DHT.
 type nodeClient struct {
@@ -75,6 +92,10 @@ type nodeClient struct {
 	mu    sync.Mutex
 	good  []peer.ID                       // member nodes known to answer data routes; tried first
 	owner *expirable.LRU[string, peer.ID] // userID -> its home node (domain.User.NodeId); user-scoped routes target it
+
+	// stream sends one attempt to a single member; defaults to streamToMember and
+	// is overridable in tests to exercise the hedging/timeout logic without a host.
+	stream func(ctx context.Context, p peer.ID, route string, payload any) ([]byte, error)
 }
 
 // networkEntries are the network's bootstrap relays (the DHT entry points).
@@ -197,16 +218,18 @@ func connectNetwork(ctx context.Context) (*nodeClient, error) {
 	}
 	log.Infof("nodeclient %v: joined Warpnet (%s) via %d relay(s); discovering members via DHT", h.ID(), network, connected)
 
-	return &nodeClient{
+	c := &nodeClient{
 		h: h, priv: priv, dht: kdht, relays: relays,
 		owner: expirable.NewLRU[string, peer.ID](ownerCacheSize, nil, ownerCacheTTL),
-	}, nil
+	}
+	c.stream = c.streamToMember
+	return c, nil
 }
 
 // request streams the route to the member nodes discovered via the DHT, trying
 // each until one answers (relays serve only discovery, so they are excluded).
 func (c *nodeClient) request(route string, payload any) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 
 	peers := c.memberCandidates()
@@ -222,14 +245,68 @@ func (c *nodeClient) request(route string, payload any) ([]byte, error) {
 		return nil, fmt.Errorf("nodeclient: %s: no Warpnet member nodes discovered yet", route)
 	}
 
-	var lastErr error
-	for _, p := range peers {
-		bt, err := c.streamToMember(ctx, p, route, payload)
-		if err == nil {
-			c.remember(p)
-			return bt, nil
+	return c.tryMembers(ctx, peers, route, payload)
+}
+
+// tryMembers streams the route to the candidates using hedged requests: it starts
+// with the first (the remembered-good node), and every hedgeDelay without a reply
+// it races one more candidate in parallel. A candidate that fails fast triggers
+// the next immediately. The first success wins and cancels the rest, so a slow or
+// dead node adds at most hedgeDelay to the request instead of stalling it for the
+// whole budget. Each attempt is bounded by perPeerTimeout.
+func (c *nodeClient) tryMembers(ctx context.Context, peers []peer.ID, route string, payload any) ([]byte, error) {
+	type reply struct {
+		peer peer.ID
+		bt   []byte
+		err  error
+	}
+
+	attemptCtx, cancelAll := context.WithCancel(ctx)
+	defer cancelAll() // cancel any still-running attempts on return
+
+	replies := make(chan reply, len(peers))
+	launch := func(p peer.ID) {
+		go func() {
+			aCtx, cancel := context.WithTimeout(attemptCtx, perPeerTimeout)
+			defer cancel()
+			bt, err := c.stream(aCtx, p, route, payload)
+			replies <- reply{peer: p, bt: bt, err: err}
+		}()
+	}
+
+	next, inFlight := 0, 0
+	launchNext := func() {
+		if next < len(peers) {
+			launch(peers[next])
+			next++
+			inFlight++
 		}
-		lastErr = err
+	}
+	launchNext()
+
+	hedge := time.NewTimer(hedgeDelay)
+	defer hedge.Stop()
+
+	var lastErr error
+	for inFlight > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("nodeclient: %s: %w", route, ctx.Err())
+		case r := <-replies:
+			inFlight--
+			if r.err == nil {
+				c.remember(r.peer)
+				return r.bt, nil
+			}
+			lastErr = r.err
+			launchNext() // a candidate failed — try the next one right away
+		case <-hedge.C:
+			launchNext() // in-flight attempt is slow — hedge with another
+			hedge.Reset(hedgeDelay)
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no reachable member nodes")
 	}
 	return nil, fmt.Errorf("nodeclient: %s failed on all member nodes: %w", route, lastErr)
 }
@@ -242,8 +319,8 @@ func (c *nodeClient) request(route string, payload any) ([]byte, error) {
 // back to the broadcast request when the owner can't be resolved or reached.
 func (c *nodeClient) requestUser(userID, route string, payload any) ([]byte, error) {
 	if owner, ok := c.ownerNode(userID); ok {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		bt, err := c.streamToMember(ctx, owner, route, payload)
+		ctx, cancel := context.WithTimeout(context.Background(), perPeerTimeout)
+		bt, err := c.stream(ctx, owner, route, payload)
 		cancel()
 		if err == nil {
 			c.remember(owner)

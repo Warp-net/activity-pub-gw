@@ -179,8 +179,9 @@ func (g *gateway) routes() http.Handler {
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
 		next.ServeHTTP(sw, r)
-		log.Infof("http: %s %s -> %d (ua=%q)", r.Method, r.URL.RequestURI(), sw.status, r.UserAgent())
+		log.Infof("http: %s %s -> %d in %s (ua=%q)", r.Method, r.URL.RequestURI(), sw.status, time.Since(start).Round(time.Millisecond), r.UserAgent())
 	})
 }
 
