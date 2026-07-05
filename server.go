@@ -32,6 +32,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -112,6 +113,11 @@ type gateway struct {
 	// collapses onto one round-trip. Transient, in memory, 1s TTL — not storage.
 	getCache *expirable.LRU[string, cachedGet]
 
+	// logs buffers recent log lines for the /logs endpoint; logsToken gates it
+	// (empty token = endpoint disabled). Both are in-memory only.
+	logs      *logRing
+	logsToken string
+
 	// allowPrivateTargets disables the SSRF guard's loopback/private-range
 	// rejection for outbound delivery. Test-only; never set in main.go.
 	allowPrivateTargets bool
@@ -161,6 +167,7 @@ func (g *gateway) routes() http.Handler {
 	mux.HandleFunc(pathInbox, g.handleSharedInbox)
 	mux.HandleFunc(pathMedia, g.handleMedia)
 	mux.HandleFunc(pathStatic, g.handleStatic)
+	mux.HandleFunc("/logs", g.handleLogs)
 	if g.limits == nil {
 		g.limits = newRateLimiters()
 	}
@@ -185,6 +192,30 @@ type statusWriter struct {
 func (w *statusWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// handleLogs serves the in-memory log ring as text/plain. It is gated by
+// GATEWAY_LOGS_TOKEN (supplied as ?token= or a Bearer header): the endpoint is
+// disabled (404) unless a token is configured, so the Funnel-exposed gateway
+// never leaks its logs publicly by default.
+func (g *gateway) handleLogs(w http.ResponseWriter, r *http.Request) {
+	if g.logsToken == "" || g.logs == nil {
+		http.NotFound(w, r)
+		return
+	}
+	provided := r.URL.Query().Get("token")
+	if provided == "" {
+		provided = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	}
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(g.logsToken)) != 1 {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set(headerContentType, "text/plain; charset=utf-8")
+	for _, line := range g.logs.lines() {
+		_, _ = io.WriteString(w, line+"\n")
+	}
 }
 
 func (g *gateway) handleWebFinger(w http.ResponseWriter, r *http.Request) {

@@ -1143,6 +1143,43 @@ func TestGetTweetAndStatsUseMastodonREST(t *testing.T) {
 	}
 }
 
+// The /logs endpoint must stay disabled without a token, reject a wrong token,
+// and otherwise serve the buffered log lines (via query param or Bearer header).
+func TestLogsEndpoint(t *testing.T) {
+	g := testGateway(t)
+	ring := newLogRing(10)
+	_ = ring.Fire(&log.Entry{Time: time.Now(), Level: log.InfoLevel, Message: "hello world"})
+	g.logs = ring
+
+	g.logsToken = ""
+	rec := httptest.NewRecorder()
+	g.handleLogs(rec, httptest.NewRequest(http.MethodGet, "/logs", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("no-token code = %d, want 404", rec.Code)
+	}
+
+	g.logsToken = "sekret"
+	rec = httptest.NewRecorder()
+	g.handleLogs(rec, httptest.NewRequest(http.MethodGet, "/logs?token=nope", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("bad-token code = %d, want 401", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	g.handleLogs(rec, httptest.NewRequest(http.MethodGet, "/logs?token=sekret", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "hello world") {
+		t.Fatalf("query-token code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/logs", nil)
+	req.Header.Set("Authorization", "Bearer sekret")
+	g.handleLogs(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "hello world") {
+		t.Fatalf("bearer code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
 // Every outbound fetch a request fans out to must be logged under one trace id,
 // indented and numbered, so the log maps a libp2p request to its REST calls.
 func TestTracedFetchesShareOneID(t *testing.T) {
