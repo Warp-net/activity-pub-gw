@@ -1041,12 +1041,14 @@ func TestGetRepliesUsesMastodonContext(t *testing.T) {
 // one page, unwrapping boosts and embedding media, and page by max_id.
 func TestGetTweetsUsesMastodonREST(t *testing.T) {
 	g := testGateway(t)
+	var statusesQuery string
 	var srv *httptest.Server
 	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/accounts/lookup":
 			writeJSON(w, "application/json", map[string]any{"id": "42", "acct": "alice"})
 		case "/api/v1/accounts/42/statuses":
+			statusesQuery = r.URL.RawQuery
 			writeJSON(w, "application/json", []any{
 				map[string]any{
 					"id": "100", "uri": srv.URL + "/users/alice/statuses/100",
@@ -1100,6 +1102,58 @@ func TestGetTweetsUsesMastodonREST(t *testing.T) {
 	}
 	if !strings.Contains(resp.Cursor, "max_id=101") {
 		t.Errorf("cursor = %q, want max_id=101", resp.Cursor)
+	}
+	// The profile timeline (Posts tab) must exclude replies, mirroring warpnet's
+	// own timeline keyspace which never stores replies.
+	if !strings.Contains(statusesQuery, "exclude_replies=true") {
+		t.Errorf("statuses query = %q, want exclude_replies=true", statusesQuery)
+	}
+}
+
+// A PUBLIC_GET_TWEETS request carrying root_id/parent_id is a thread-replies
+// request (warpnet folded replies into this route): the gateway must return the
+// note's replies as a flat TweetsResponse, not resolve an empty user handle.
+func TestGetTweetsOrRepliesServesThreadReplies(t *testing.T) {
+	g := testGateway(t)
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/statuses/100/context" {
+			writeJSON(w, "application/json", map[string]any{
+				"ancestors": []any{},
+				"descendants": []any{
+					map[string]any{
+						"id": "101", "uri": srv.URL + "/users/bob/statuses/101",
+						"content": "<p>a reply</p>", "created_at": "2024-01-01T00:00:00.000Z",
+						"in_reply_to_id": "100", "account": map[string]any{"acct": "bob"},
+					},
+				},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+	host := strings.TrimPrefix(srv.URL, "https://")
+
+	b := newMastodonBridge(g, "node1")
+	root := srv.URL + "/users/alice/statuses/100"
+	resp, err := b.GetTweetsOrReplies(context.Background(), getTweetsRequest{RootId: root})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(resp.Tweets) != 1 {
+		t.Fatalf("tweets = %d, want 1 (flat replies): %+v", len(resp.Tweets), resp.Tweets)
+	}
+	r0 := resp.Tweets[0]
+	if r0.Id != srv.URL+"/users/bob/statuses/101" {
+		t.Errorf("r0.Id = %q, want the reply uri", r0.Id)
+	}
+	if r0.UserId != "bob@"+host {
+		t.Errorf("r0.UserId = %q, want bob@%s", r0.UserId, host)
+	}
+	if r0.RootId != root {
+		t.Errorf("r0.RootId = %q, want %q", r0.RootId, root)
 	}
 }
 

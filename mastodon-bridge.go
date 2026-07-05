@@ -162,6 +162,26 @@ func pageCursor(cursor *string) string {
 	return *cursor
 }
 
+// GetTweetsOrReplies serves the PUBLIC_GET_TWEETS route. Warpnet folded thread
+// replies into it: a plain profile request carries only a userId (handle),
+// while a thread-replies request carries root_id/parent_id (the note whose
+// replies are wanted) and expects the replies back as a flat TweetsResponse,
+// not the RepliesResponse tree.
+func (b *mastodonBridge) GetTweetsOrReplies(ctx context.Context, ev getTweetsRequest) (tweetsResponse, error) {
+	if ev.RootId != "" || ev.ParentId != "" {
+		id := ev.ParentId
+		if id == "" {
+			id = ev.RootId
+		}
+		rr, err := b.GetReplies(ctx, id)
+		if err != nil {
+			return tweetsResponse{}, err
+		}
+		return repliesToTweets(rr), nil
+	}
+	return b.GetTweets(ctx, ev.UserId, ev.Cursor)
+}
+
 // GetTweets renders a remote actor's timeline as Warpnet tweets. Mastodon-family
 // instances serve a full status page (counts, boosts, media inline) from one
 // REST call, avoiding the per-item dereferences the AP outbox needs; others fall
@@ -202,7 +222,10 @@ func (b *mastodonBridge) restTweets(ctx context.Context, handle string) (tweetsR
 	if accID == "" {
 		return tweetsResponse{}, false
 	}
-	return b.restTweetsPage(ctx, handle, "https://"+instance+"/api/v1/accounts/"+accID+"/statuses?limit=40")
+	// exclude_replies mirrors warpnet's own profile timeline, which is served
+	// from the author's timeline keyspace and never contains replies; the Posts
+	// tab must show only top-level posts (thread replies come from GetReplies).
+	return b.restTweetsPage(ctx, handle, "https://"+instance+"/api/v1/accounts/"+accID+"/statuses?limit=40&exclude_replies=true")
 }
 
 // restTweetsPage fetches one REST status page and maps it, deriving the next
@@ -405,6 +428,22 @@ func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (replie
 		return resp, nil
 	}
 	return b.apReplies(ctx, noteURL)
+}
+
+// repliesToTweets flattens a reply tree into the flat TweetsResponse that
+// warpnet's folded reply route (PUBLIC_GET_TWEETS with root_id/parent_id)
+// returns — the client parses the response as a plain tweet list, not a tree.
+func repliesToTweets(rr repliesResponse) tweetsResponse {
+	resp := tweetsResponse{Tweets: []tweet{}}
+	var walk func([]domain.ReplyNode)
+	walk = func(nodes []domain.ReplyNode) {
+		for _, n := range nodes {
+			resp.Tweets = append(resp.Tweets, n.Reply)
+			walk(n.Children)
+		}
+	}
+	walk(rr.Replies)
+	return resp
 }
 
 // maxReplies bounds how many replies GetReplies returns from either path.
