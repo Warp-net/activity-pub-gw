@@ -64,7 +64,10 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.58"
+const gatewayVersion = "0.1.60"
+
+// logRingSize is how many recent log lines the /logs endpoint retains in memory.
+const logRingSize = 2000
 
 const fatalFmt = "gateway: %v"
 
@@ -72,6 +75,9 @@ func main() {
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true, TimestampFormat: time.DateTime})
 	log.SetOutput(os.Stdout)
 	log.SetLevel(log.InfoLevel)
+	// Mirror logs into an in-memory ring so the /logs endpoint can serve them.
+	logs := newLogRing(logRingSize)
+	log.AddHook(logs)
 	log.Infof("gateway: starting version %s", gatewayVersion)
 
 	keyPath := envOr("GATEWAY_KEY", "fediverse-gateway-key.pem")
@@ -145,8 +151,10 @@ func main() {
 		req:       req,
 		// Retry transient Mastodon HTTP failures (network errors, 429, 5xx) a few
 		// times with exponential backoff; bounded so it stays within the request budget.
-		retrier:  retrier.New(300*time.Millisecond, 3, retrier.ExponentialBackoff),
-		getCache: expirable.NewLRU[string, cachedGet](getCacheSize, nil, getCacheTTL),
+		retrier:   retrier.New(300*time.Millisecond, 3, retrier.ExponentialBackoff),
+		getCache:  expirable.NewLRU[string, cachedGet](getCacheSize, nil, getCacheTTL),
+		logs:      logs,
+		logsToken: os.Getenv("GATEWAY_LOGS_TOKEN"),
 	}
 
 	// Serve Warpnet's public /public routes over libp2p (Mastodon -> Warpnet):

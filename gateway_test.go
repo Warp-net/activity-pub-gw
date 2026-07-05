@@ -19,6 +19,7 @@ import (
 
 	"github.com/Warp-net/warpnet/retrier"
 	"github.com/hashicorp/golang-lru/v2/expirable"
+	log "github.com/sirupsen/logrus"
 )
 
 func testGateway(t *testing.T) *gateway {
@@ -1139,6 +1140,81 @@ func TestGetTweetAndStatsUseMastodonREST(t *testing.T) {
 	}
 	if stats.LikeCount != 5 || stats.RetweetsCount != 2 || stats.RepliesCount != 3 {
 		t.Errorf("stats = %+v, want likes=5 boosts=2 replies=3", stats)
+	}
+}
+
+// The /logs endpoint must stay disabled without a token, reject a wrong token,
+// and otherwise serve the buffered log lines (via query param or Bearer header).
+func TestLogsEndpoint(t *testing.T) {
+	g := testGateway(t)
+	ring := newLogRing(10)
+	_ = ring.Fire(&log.Entry{Time: time.Now(), Level: log.InfoLevel, Message: "hello world"})
+	g.logs = ring
+
+	g.logsToken = ""
+	rec := httptest.NewRecorder()
+	g.handleLogs(rec, httptest.NewRequest(http.MethodGet, "/logs", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("no-token code = %d, want 404", rec.Code)
+	}
+
+	g.logsToken = "sekret"
+	rec = httptest.NewRecorder()
+	g.handleLogs(rec, httptest.NewRequest(http.MethodGet, "/logs?token=nope", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("bad-token code = %d, want 401", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	g.handleLogs(rec, httptest.NewRequest(http.MethodGet, "/logs?token=sekret", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "hello world") {
+		t.Fatalf("query-token code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/logs", nil)
+	req.Header.Set("Authorization", "Bearer sekret")
+	g.handleLogs(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "hello world") {
+		t.Fatalf("bearer code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+// Every outbound fetch a request fans out to must be logged under one trace id,
+// indented and numbered, so the log maps a libp2p request to its REST calls.
+func TestTracedFetchesShareOneID(t *testing.T) {
+	g := testGateway(t)
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/lookup":
+			writeJSON(w, "application/json", map[string]any{"id": "42"})
+		case "/api/v1/accounts/42/statuses":
+			writeJSON(w, "application/json", []any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+
+	var buf bytes.Buffer
+	prevOut, prevLvl := log.StandardLogger().Out, log.GetLevel()
+	log.SetOutput(&buf)
+	log.SetLevel(log.InfoLevel)
+	defer func() { log.SetOutput(prevOut); log.SetLevel(prevLvl) }()
+
+	ctx, tr := startTrace(context.Background())
+	b := newMastodonBridge(g, "node1")
+	if _, err := b.GetTweets(ctx, "alice@"+strings.TrimPrefix(srv.URL, "https://"), nil); err != nil {
+		t.Fatalf("GetTweets: %v", err)
+	}
+	if tr.calls.Load() != 2 { // lookup + statuses
+		t.Fatalf("traced calls = %d, want 2", tr.calls.Load())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "  ["+tr.id+"] #1 GET") || !strings.Contains(out, "["+tr.id+"] #2 GET") {
+		t.Errorf("log missing padded, id-tagged fetch lines:\n%s", out)
 	}
 }
 
