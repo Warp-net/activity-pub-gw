@@ -190,16 +190,43 @@ func (b *mastodonBridge) GetTweets(ctx context.Context, handle string, cursor *s
 		return tweetsResponse{}, err
 	}
 	resp := tweetsResponse{UserId: handle, Cursor: asString(page["next"])}
-	for _, it := range asSlice(page["orderedItems"]) {
+	resp.Tweets = b.resolveTimelineItems(ctx, handle, asSlice(page["orderedItems"]))
+	return resp, nil
+}
+
+// resolveTimelineItems renders one outbox page's items into tweets concurrently,
+// preserving order. Each item may trigger its own fetches (a boost dereferences
+// the boosted note, a quote resolves its author), so rendering them serially
+// would serialize a round-trip per item; a bounded pool keeps the fan-out gentle.
+func (b *mastodonBridge) resolveTimelineItems(ctx context.Context, handle string, items []any) []tweet {
+	const maxConcurrent = 8
+	out := make([]tweet, len(items))
+	ok := make([]bool, len(items))
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	for i, it := range items {
 		obj := asMap(it)
 		if obj == nil {
 			continue
 		}
-		if t, ok := b.activityToTweet(ctx, handle, obj); ok {
-			resp.Tweets = append(resp.Tweets, t)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if t, good := b.activityToTweet(ctx, handle, obj); good {
+				out[i], ok[i] = t, true
+			}
+		}()
+	}
+	wg.Wait()
+	tweets := make([]tweet, 0, len(items))
+	for i := range items {
+		if ok[i] {
+			tweets = append(tweets, out[i])
 		}
 	}
-	return resp, nil
+	return tweets
 }
 
 // activityToTweet turns one outbox item (Create wrapping a Note, a bare Note, or
@@ -294,7 +321,7 @@ func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (replie
 	// as note URIs (strings), so each is dereferenced; some servers inline the
 	// note objects instead. Bounded so a long thread can't run unbounded fetches.
 	const (
-		maxReplies = 50
+		maxReplies = 20
 		maxPages   = 5
 	)
 	for p := 0; p < maxPages && len(resp.Replies) < maxReplies; p++ {
