@@ -49,6 +49,7 @@ import (
 	"github.com/Warp-net/warpnet/retrier"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -112,6 +113,12 @@ type gateway struct {
 	// burst of per-tweet/per-actor fetches a single timeline render triggers
 	// collapses onto one round-trip. Transient, in memory, 1s TTL — not storage.
 	getCache *expirable.LRU[string, cachedGet]
+
+	// sf collapses concurrent identical signed GETs onto a single upstream
+	// round-trip. getCache only dedupes sequential bursts (it fills after a
+	// request returns), so the overlapping author/stats/context fetches a reply
+	// thread fans out would each miss the cache and hit the remote independently.
+	sf singleflight.Group
 
 	// logs buffers recent log lines for the /logs endpoint; logsToken gates it
 	// (empty token = endpoint disabled). Both are in-memory only.
@@ -692,24 +699,38 @@ func (g *gateway) signedGet(ctx context.Context, rawURL, accept string) (int, []
 			return c.status, c.body, nil
 		}
 	}
-	start := time.Now()
-	status, bt, _, err := g.sendRetry(ctx, func() (*http.Request, error) {
-		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-		if rerr != nil {
-			return nil, rerr
+	v, err, _ := g.sf.Do(key, func() (any, error) {
+		// A concurrent flight may have populated the cache while we queued.
+		if g.getCache != nil {
+			if c, ok := g.getCache.Get(key); ok {
+				logFetch(ctx, "GET", rawURL, c.status, 0, true)
+				return c, nil
+			}
 		}
-		req.Header.Set("Accept", accept)
-		return req, g.signGet(req)
+		start := time.Now()
+		status, bt, _, ferr := g.sendRetry(ctx, func() (*http.Request, error) {
+			req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+			if rerr != nil {
+				return nil, rerr
+			}
+			req.Header.Set("Accept", accept)
+			return req, g.signGet(req)
+		})
+		if ferr != nil {
+			logFetch(ctx, "GET", rawURL, 0, time.Since(start), false)
+			return cachedGet{}, ferr
+		}
+		logFetch(ctx, "GET", rawURL, status, time.Since(start), false)
+		if g.getCache != nil {
+			g.getCache.Add(key, cachedGet{status: status, body: bt})
+		}
+		return cachedGet{status: status, body: bt}, nil
 	})
 	if err != nil {
-		logFetch(ctx, "GET", rawURL, 0, time.Since(start), false)
 		return 0, nil, err
 	}
-	logFetch(ctx, "GET", rawURL, status, time.Since(start), false)
-	if g.getCache != nil {
-		g.getCache.Add(key, cachedGet{status: status, body: bt})
-	}
-	return status, bt, nil
+	c := v.(cachedGet)
+	return c.status, c.body, nil
 }
 
 func (g *gateway) fetchActor(ctx context.Context, actorURL string) (map[string]any, error) {

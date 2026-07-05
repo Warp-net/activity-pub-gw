@@ -1268,6 +1268,45 @@ func TestSignedGetCacheDedupes(t *testing.T) {
 	}
 }
 
+// Concurrent identical signed GETs must collapse onto a single upstream
+// round-trip via single-flight. The 1s getCache only dedupes sequential bursts
+// (it fills after a request returns), so a reply thread that fans out
+// overlapping author/stats fetches relies on single-flight. getCache is left
+// nil so only single-flight can do the deduping here.
+func TestSignedGetSingleFlightDedupes(t *testing.T) {
+	g := testGateway(t)
+	g.getCache = nil
+	release := make(chan struct{})
+	var hits int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		<-release // hold the in-flight request open so callers must coalesce
+		writeJSON(w, "application/json", map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _ = g.signedGet(context.Background(), srv.URL+"/thing", "application/json")
+		}()
+	}
+	// Give every goroutine time to enter the single flight before releasing the
+	// one in-flight request; with getCache nil, any that didn't coalesce would
+	// hit the origin separately.
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("origin hits = %d, want 1 (single-flight should collapse concurrent GETs)", got)
+	}
+}
+
 // Warpnet paginates GET_TWEETS with the requesting node's own datastore cursor
 // (e.g. "/TWEETS/<user>/<seq>/<noteURL>"), not the AP "next" URL the gateway
 // returned. The gateway must ignore such a cursor and serve the first outbox
