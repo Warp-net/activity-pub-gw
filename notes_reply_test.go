@@ -4,6 +4,8 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -77,5 +79,43 @@ func TestReplyEventFromTweet(t *testing.T) {
 	}
 	if re.Text != "Cool!" || re.UserId != "01USER0000000000000000000" || re.Username != "Vadim" {
 		t.Fatalf("fields: %+v", re)
+	}
+}
+
+// TestServeRepliesUsesTweetsAPI verifies the replies collection is sourced from
+// PUBLIC_GET_TWEETS with the note as parent_id (warpnet retired the standalone
+// PUBLIC_GET_REPLIES route), and that fediverse-authored replies are skipped.
+func TestServeRepliesUsesTweetsAPI(t *testing.T) {
+	g := testGateway(t)
+	parent := "01PARENT0000000000000000000"
+	native := tweet{
+		Id: "01REPLY00000000000000000000", ParentId: &parent, RootId: parent,
+		UserId: "alice", Username: "alice", Text: "native reply", CreatedAt: time.Unix(0, 0),
+	}
+	foreign := tweet{
+		Id: "01REPLY20000000000000000000", ParentId: &parent, RootId: parent,
+		UserId: apFollowerPrefix + "xxx", Username: "bob@m", Text: "foreign reply", CreatedAt: time.Unix(0, 0),
+	}
+	bt, _ := json.Marshal(tweetsResponse{Tweets: []tweet{native, foreign}})
+	fr := &fakeRequester{tweetsJSON: bt}
+	g.req = fr
+
+	w := httptest.NewRecorder()
+	g.serveReplies(w, "alice", parent)
+
+	if fr.lastRoute != routeGetTweets {
+		t.Fatalf("route = %q, want %q", fr.lastRoute, routeGetTweets)
+	}
+	req, ok := fr.lastPayload.(getTweetsRequest)
+	if !ok || req.ParentId != parent || req.UserId != "alice" {
+		t.Fatalf("payload = %+v", fr.lastPayload)
+	}
+
+	var col orderedCollection
+	if err := json.Unmarshal(w.Body.Bytes(), &col); err != nil {
+		t.Fatalf("decode collection: %v", err)
+	}
+	if col.TotalItems != 1 || len(col.OrderedItems) != 1 {
+		t.Fatalf("items = %d, want 1 (fediverse reply must be skipped)", col.TotalItems)
 	}
 }

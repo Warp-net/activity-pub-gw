@@ -211,6 +211,7 @@ type fakeRequester struct {
 	followingsJSON []byte
 	imageFile      string
 	tweet          tweet
+	tweetsJSON     []byte
 }
 
 func (f *fakeRequester) request(route string, payload any) ([]byte, error) {
@@ -227,6 +228,10 @@ func (f *fakeRequester) request(route string, payload any) ([]byte, error) {
 	case routeGetTweet:
 		bt, _ := json.Marshal(f.tweet)
 		return bt, nil
+	case routeGetTweets:
+		if f.tweetsJSON != nil {
+			return f.tweetsJSON, nil
+		}
 	}
 	return []byte(`["accepted"]`), nil
 }

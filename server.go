@@ -505,30 +505,31 @@ func (g *gateway) serveFollowing(w http.ResponseWriter, user string) {
 	})
 }
 
-// serveReplies renders the replies to a Note (PUBLIC_GET_REPLIES) as an
-// OrderedCollection of Notes for thread context. Only Warpnet-authored replies
-// are inlined; fediverse replies (ap: ids) are omitted — Mastodon has its own.
+// serveReplies renders the replies to a Note as an OrderedCollection of Notes
+// for thread context. Warpnet folded replies into the tweets API, so the direct
+// replies come from PUBLIC_GET_TWEETS with the note as parent_id. Only
+// Warpnet-authored replies are inlined; fediverse replies (ap: ids) are omitted
+// — Mastodon has its own.
 func (g *gateway) serveReplies(w http.ResponseWriter, user, tweetID string) {
 	id := g.actorID(user) + pathStatuses + tweetID + "/replies"
 	if g.req == nil {
 		g.serveEmptyCollection(w, id)
 		return
 	}
-	bt, err := g.req.requestUser(user, routeGetReplies, getTweetEvent{TweetId: tweetID, UserId: user})
+	bt, err := g.req.requestUser(user, routeGetTweets, getTweetsRequest{UserId: user, ParentId: tweetID})
 	if err != nil {
 		log.Warnf("replies: fetch %s/%s: %v", user, tweetID, err)
 		g.serveEmptyCollection(w, id)
 		return
 	}
-	var resp repliesResponse
+	var resp tweetsResponse
 	if jerr := json.Unmarshal(bt, &resp); jerr != nil {
 		g.serveEmptyCollection(w, id)
 		return
 	}
 	parentURL := g.actorID(user) + pathStatuses + tweetID
-	items := make([]any, 0, len(resp.Replies))
-	for _, rn := range resp.Replies {
-		t := rn.Reply
+	items := make([]any, 0, len(resp.Tweets))
+	for _, t := range resp.Tweets {
 		if t.Id == "" || strings.HasPrefix(t.UserId, apFollowerPrefix) {
 			continue // skip fediverse-authored replies; Mastodon already has them
 		}
