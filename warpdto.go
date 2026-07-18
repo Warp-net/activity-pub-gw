@@ -111,3 +111,14 @@ type deleteTweetRequest struct {
 	ParentId string `json:"parent_id"`
 	RootId   string `json:"root_id"`
 }
+
+// getTweetRequest is the PUBLIC_GET_TWEET body. The pinned event.GetTweetEvent
+// predates parent_id/root_id, but the node needs the parent to resolve a reply
+// (replies are keyed under their parent, not the author's timeline), so send
+// them explicitly when serving a reply status.
+type getTweetRequest struct {
+	UserId   string `json:"user_id"`
+	TweetId  string `json:"tweet_id"`
+	ParentId string `json:"parent_id,omitempty"`
+	RootId   string `json:"root_id,omitempty"`
+}

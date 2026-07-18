@@ -76,6 +76,10 @@ const (
 	pathFollowers     = "/followers"
 	pathStatuses      = "/statuses/"
 	pathMedia         = "/media/"
+	// replyParentQuery carries a reply note's parent url on its own status id, so
+	// serveStatus can hand the node the thread key it needs to resolve a reply
+	// (the node stores replies under their parent, not in the author's timeline).
+	replyParentQuery = "parent"
 
 	headerContentType = "Content-Type"
 )

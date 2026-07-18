@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"html"
 	"net/http"
+	"net/url"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -109,10 +110,13 @@ func (g *gateway) serveStatus(w http.ResponseWriter, r *http.Request, user, twee
 		http.NotFound(w, r)
 		return
 	}
-	bt, err := g.req.request(routeGetTweet, getTweetEvent{
-		TweetId: tweetID,
-		UserId:  user,
-	})
+	req := getTweetRequest{TweetId: tweetID, UserId: user}
+	// A reply carries its parent url on the id (see b.Reply); pass it so the node
+	// can look the reply up in the parent's thread index instead of the timeline.
+	if parent := r.URL.Query().Get(replyParentQuery); parent != "" {
+		req.ParentId = parent
+	}
+	bt, err := g.req.request(routeGetTweet, req)
 	if err != nil {
 		log.Warnf("status: fetch %s/%s: %v", user, tweetID, err)
 		http.NotFound(w, r)
@@ -125,5 +129,12 @@ func (g *gateway) serveStatus(w http.ResponseWriter, r *http.Request, user, twee
 	}
 	n := g.buildNote(user, t)
 	n.Context = asContext
+	// For a reply, make the served note match what b.Reply federated: its id
+	// carries the parent (so it equals the url the remote instance dereferenced)
+	// and InReplyTo is the real parent url, not buildNote's local status path.
+	if parent := r.URL.Query().Get(replyParentQuery); parent != "" {
+		n.ID = g.actorID(user) + pathStatuses + t.Id + "?" + url.Values{replyParentQuery: {parent}}.Encode()
+		n.InReplyTo = parent
+	}
 	writeJSON(w, contentTypeAP, n)
 }

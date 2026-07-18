@@ -863,9 +863,14 @@ func (b *mastodonBridge) Reply(ctx context.Context, ev newReplyEvent) error {
 	if noteID == "" {
 		noteID = randomToken()
 	}
+	noteURL := actorID + pathStatuses + noteID
+	// Carry the parent url on the reply's own id: the node keys replies under
+	// their parent, so serveStatus needs it to resolve this note when a remote
+	// instance dereferences the id (a bare id only resolves a top-level tweet).
+	replyURL := noteURL + "?" + url.Values{replyParentQuery: {parentURL}}.Encode()
 	n := note{
 		Context:      asContext,
-		ID:           actorID + pathStatuses + noteID,
+		ID:           replyURL,
 		Type:         typeNote,
 		AttributedTo: actorID,
 		Content:      ev.Text,
@@ -874,7 +879,7 @@ func (b *mastodonBridge) Reply(ctx context.Context, ev newReplyEvent) error {
 		To:           []string{author},
 		Cc:           []string{asPublic},
 	}
-	create := activity{Context: asContext, ID: n.ID + "#create", Type: typeCreate, Actor: actorID, Object: n, To: []string{author}, Cc: []string{asPublic}}
+	create := activity{Context: asContext, ID: noteURL + "#create", Type: typeCreate, Actor: actorID, Object: n, To: []string{author}, Cc: []string{asPublic}}
 	return b.ap.postSigned(ctx, localUser, inbox, create)
 }
 
