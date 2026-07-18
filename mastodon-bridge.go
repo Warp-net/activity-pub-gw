@@ -878,6 +878,34 @@ func (b *mastodonBridge) Reply(ctx context.Context, ev newReplyEvent) error {
 	return b.ap.postSigned(ctx, localUser, inbox, create)
 }
 
+// Delete federates the deletion of a Warpnet reply to a Mastodon note as an AP
+// Delete(Tombstone) addressed to the parent author, mirroring the Create that
+// Reply sent. The deleted Note id is the same deterministic /statuses/{id} url.
+func (b *mastodonBridge) Delete(ctx context.Context, ev deleteTweetRequest) error {
+	parentURL := ev.RootId
+	if ev.ParentId != "" {
+		parentURL = ev.ParentId
+	}
+	obj, inbox, err := b.authorInbox(ctx, parentURL)
+	if err != nil {
+		return err
+	}
+	author := asString(obj["attributedTo"])
+	localUser := ev.UserId
+	actorID := b.ap.actorID(localUser)
+	noteID := actorID + pathStatuses + ev.TweetId
+	del := activity{
+		Context: asContext,
+		ID:      noteID + "#delete",
+		Type:    typeDelete,
+		Actor:   actorID,
+		Object:  tombstone{ID: noteID, Type: typeTombstone},
+		To:      []string{author},
+		Cc:      []string{asPublic},
+	}
+	return b.ap.postSigned(ctx, localUser, inbox, del)
+}
+
 // authorInbox fetches an object (Note) once and resolves its author's inbox,
 // returning the fetched note so callers can also read its counts.
 func (b *mastodonBridge) authorInbox(ctx context.Context, objectURL string) (map[string]any, string, error) {

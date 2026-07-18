@@ -139,6 +139,15 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 			re := replyEventFromTweet(ev)
 			return replyEcho(re), b.Reply(ctx, re)
 		}),
+		// Warpnet forwards a reply deletion to the parent author's node over the
+		// private delete route; federate it as an AP Delete. Only a reply (a
+		// parent set) targets a Mastodon note; anything else is acknowledged.
+		routeDeleteTweet: wrapJSON(func(ctx context.Context, ev deleteTweetRequest) (any, error) {
+			if ev.ParentId == "" && ev.RootId == "" {
+				return struct{}{}, nil
+			}
+			return struct{}{}, b.Delete(ctx, ev)
+		}),
 		routePostRetweet: wrapJSON(func(ctx context.Context, ev tweet) (any, error) {
 			return ev, b.Announce(ctx, retweeterOf(ev), retweetObject(ev), false)
 		}),

@@ -204,6 +204,50 @@ func TestPublishNoteFanout(t *testing.T) {
 	}
 }
 
+// TestBridgeDeleteFederatesTombstone verifies deleting a Warpnet reply to a
+// Mastodon note posts an AP Delete(Tombstone) for the reply's note id to the
+// parent author's inbox.
+func TestBridgeDeleteFederatesTombstone(t *testing.T) {
+	g := testGateway(t)
+	var got map[string]any
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/note":
+			writeJSON(w, contentTypeAP, map[string]any{
+				"id": srv.URL + "/note", "type": "Note", "attributedTo": srv.URL + "/users/bob",
+			})
+		case r.URL.Path == "/users/bob":
+			writeJSON(w, contentTypeAP, map[string]any{
+				"id": srv.URL + "/users/bob", "inbox": srv.URL + "/inbox/bob",
+			})
+		case r.URL.Path == "/inbox/bob" && r.Method == http.MethodPost:
+			_ = json.NewDecoder(r.Body).Decode(&got)
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+
+	b := newMastodonBridge(g, "node1")
+	if err := b.Delete(context.Background(), deleteTweetRequest{
+		UserId: "alice", TweetId: "01REPLY00000000000000000000", ParentId: srv.URL + "/note",
+	}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	if got["type"] != typeDelete || got["actor"] != g.actorID("alice") {
+		t.Fatalf("activity = %+v", got)
+	}
+	obj, _ := got["object"].(map[string]any)
+	wantID := g.actorID("alice") + pathStatuses + "01REPLY00000000000000000000"
+	if obj["type"] != typeTombstone || obj["id"] != wantID {
+		t.Fatalf("object = %+v, want Tombstone id %s", got["object"], wantID)
+	}
+}
+
 type fakeRequester struct {
 	lastRoute      string
 	lastPayload    any

@@ -58,6 +58,9 @@ const (
 	// consolidated replies into the tweet path (a reply is a tweet with a
 	// parent); it superseded the standalone PUBLIC_POST_REPLY route.
 	routePostTweet = event.PRIVATE_POST_TWEET
+	// routeDeleteTweet is the route warpnet forwards a reply deletion over to
+	// the parent author's node.
+	routeDeleteTweet = event.PRIVATE_DELETE_TWEET
 )
 
 // Wire envelope + domain payloads (warpnet's own types).
@@ -97,4 +100,14 @@ type getTweetsRequest struct {
 	RootId   string  `json:"root_id"`
 	ParentId string  `json:"parent_id"`
 	Cursor   *string `json:"cursor,omitempty"`
+}
+
+// deleteTweetRequest is the PRIVATE_DELETE_TWEET body warpnet forwards for a
+// reply deletion. The pinned event.DeleteTweetEvent (= GetTweetEvent) predates
+// the thread ids, so decode parent_id/root_id here to locate the parent note.
+type deleteTweetRequest struct {
+	UserId   string `json:"user_id"`
+	TweetId  string `json:"tweet_id"`
+	ParentId string `json:"parent_id"`
+	RootId   string `json:"root_id"`
 }
