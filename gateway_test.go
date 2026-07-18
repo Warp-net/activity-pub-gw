@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -245,6 +246,56 @@ func TestBridgeDeleteFederatesTombstone(t *testing.T) {
 	wantID := g.actorID("alice") + pathStatuses + "01REPLY00000000000000000000"
 	if obj["type"] != typeTombstone || obj["id"] != wantID {
 		t.Fatalf("object = %+v, want Tombstone id %s", got["object"], wantID)
+	}
+}
+
+// TestBridgeReplyEmbedsParentInNoteID verifies a federated reply's note id
+// carries the parent url (so serveStatus can later resolve it), the note threads
+// to the real parent, and the Create id stays query-free.
+func TestBridgeReplyEmbedsParentInNoteID(t *testing.T) {
+	g := testGateway(t)
+	var got map[string]any
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/note":
+			writeJSON(w, contentTypeAP, map[string]any{
+				"id": srv.URL + "/note", "type": "Note", "attributedTo": srv.URL + "/users/bob",
+			})
+		case r.URL.Path == "/users/bob":
+			writeJSON(w, contentTypeAP, map[string]any{
+				"id": srv.URL + "/users/bob", "inbox": srv.URL + "/inbox/bob",
+			})
+		case r.URL.Path == "/inbox/bob" && r.Method == http.MethodPost:
+			_ = json.NewDecoder(r.Body).Decode(&got)
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+
+	b := newMastodonBridge(g, "node1")
+	parent := srv.URL + "/note"
+	pid := parent
+	if err := b.Reply(context.Background(), newReplyEvent{
+		UserId: "alice", Id: "r1", Text: "thank you!", RootId: parent, ParentId: &pid,
+	}); err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+
+	base := g.actorID("alice") + pathStatuses + "r1"
+	obj, _ := got["object"].(map[string]any)
+	wantNote := base + "?" + url.Values{replyParentQuery: {parent}}.Encode()
+	if obj["id"] != wantNote {
+		t.Fatalf("note id = %v, want %v", obj["id"], wantNote)
+	}
+	if obj["inReplyTo"] != parent {
+		t.Fatalf("inReplyTo = %v, want %v", obj["inReplyTo"], parent)
+	}
+	if got["id"] != base+"#create" {
+		t.Fatalf("create id = %v, want %v", got["id"], base+"#create")
 	}
 }
 
@@ -900,6 +951,44 @@ func TestServeStatus(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404", resp.StatusCode)
+		}
+	})
+
+	t.Run("reply status passes parent and threads", func(t *testing.T) {
+		g3 := testGateway(t)
+		parent := "https://mastodon.xyz/users/NGIZero/statuses/116760411158384997"
+		pid := parent
+		fr := &fakeRequester{tweet: tweet{
+			Id: "r1", UserId: "alice", Text: "thank you!", ParentId: &pid, RootId: parent,
+			CreatedAt: time.Unix(1700000000, 0),
+		}}
+		g3.req = fr
+		srv3 := httptest.NewServer(g3.routes())
+		defer srv3.Close()
+
+		want := "https://gw.example/users/alice/statuses/r1?" + url.Values{replyParentQuery: {parent}}.Encode()
+		resp, err := http.Get(srv3.URL + "/users/alice/statuses/r1?" + url.Values{replyParentQuery: {parent}}.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		// the node is asked with parent_id so it can find the reply in the thread
+		gt, ok := fr.lastPayload.(getTweetRequest)
+		if !ok || gt.ParentId != parent || gt.TweetId != "r1" {
+			t.Fatalf("payload = %+v", fr.lastPayload)
+		}
+		var n note
+		if err := json.NewDecoder(resp.Body).Decode(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n.ID != want {
+			t.Fatalf("note id = %q, want %q", n.ID, want)
+		}
+		if n.InReplyTo != parent {
+			t.Fatalf("inReplyTo = %q, want %q", n.InReplyTo, parent)
 		}
 	})
 }
