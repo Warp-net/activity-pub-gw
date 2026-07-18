@@ -40,9 +40,17 @@ const (
 	typeUndo     = "Undo"
 	typeNote     = "Note"
 	typeAnnounce = "Announce"
-	typeDelete   = "Delete"
-	typeDocument = "Document"
+	typeDelete    = "Delete"
+	typeDocument  = "Document"
+	typeTombstone = "Tombstone"
 )
+
+// tombstone is the object of an outbound Delete: it names the deleted Note by id
+// so the remote instance removes it.
+type tombstone struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+}
 
 type webFingerJRD struct {
 	Subject string          `json:"subject"`
