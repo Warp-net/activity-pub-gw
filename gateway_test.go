@@ -420,12 +420,15 @@ func TestTranslateInbound(t *testing.T) {
 		"type": "Create", "actor": actor,
 		"object": map[string]any{"type": "Note", "content": "<p>hi there</p>", "inReplyTo": status},
 	})
-	if !ok || route != routePostReply {
+	if !ok || route != routePostTweet {
 		t.Fatalf("reply: route=%q ok=%v", route, ok)
 	}
 	reply := payload.(newReplyEvent)
 	if reply.RootId != "t1" || reply.ParentId == nil || *reply.ParentId != "t1" || reply.Text != "hi there" {
 		t.Fatalf("reply event: %+v", reply)
+	}
+	if reply.ParentUserId != "alice" {
+		t.Fatalf("reply parent_user_id = %q, want alice", reply.ParentUserId)
 	}
 	if reply.Username != "bob@m" {
 		t.Fatalf("reply username = %q, want bob@m", reply.Username)
@@ -436,7 +439,7 @@ func TestTranslateInbound(t *testing.T) {
 		"type": "Create", "actor": actor,
 		"object": map[string]any{"type": "Note", "content": "<p>RE: <a href=\"" + status + "\">" + status + "</a> nice post</p>"},
 	})
-	if !ok || route != routePostReply {
+	if !ok || route != routePostTweet {
 		t.Fatalf("RE reply: route=%q ok=%v", route, ok)
 	}
 	reply = payload.(newReplyEvent)

@@ -52,3 +52,30 @@ func TestBuildNoteThreadsReplies(t *testing.T) {
 		})
 	}
 }
+
+// TestReplyEventFromTweet verifies a reply forwarded over the private tweet
+// route (a tweet with a parent) is adapted into the reply event the bridge
+// federates, carrying the thread ids, author and text.
+func TestReplyEventFromTweet(t *testing.T) {
+	parent := "https://m/users/bob/statuses/9"
+	pid := parent
+	in := tweet{
+		Id:        "01REPLY00000000000000000000",
+		ParentId:  &pid,
+		RootId:    "https://m/users/bob/statuses/1",
+		Text:      "Cool!",
+		UserId:    "01USER0000000000000000000",
+		Username:  "Vadim",
+		CreatedAt: time.Unix(0, 0),
+	}
+	re := replyEventFromTweet(in)
+	if re.ParentId == nil || *re.ParentId != parent {
+		t.Fatalf("ParentId = %v, want %q", re.ParentId, parent)
+	}
+	if re.Id != "01REPLY00000000000000000000" || re.RootId != "https://m/users/bob/statuses/1" {
+		t.Fatalf("ids: %+v", re)
+	}
+	if re.Text != "Cool!" || re.UserId != "01USER0000000000000000000" || re.Username != "Vadim" {
+		t.Fatalf("fields: %+v", re)
+	}
+}

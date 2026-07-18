@@ -121,7 +121,11 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 			}
 		}
 		pid := parentID
-		return routePostReply, newReplyEvent{
+		// Warpnet consolidated replies into the tweet path: it accepts a reply
+		// as a tweet with a parent on the private tweet route, not the retired
+		// PUBLIC_POST_REPLY route. parent_user_id lets the owner's node raise the
+		// reply notification.
+		return routePostTweet, newReplyEvent{
 			CreatedAt:    time.Now(),
 			Id:           randomToken(),
 			ParentId:     &pid,

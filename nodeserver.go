@@ -128,6 +128,17 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 		routePostReply: wrapJSON(func(ctx context.Context, ev newReplyEvent) (any, error) {
 			return replyEcho(ev), b.Reply(ctx, ev)
 		}),
+		// Warpnet consolidated replies into the tweet path: a reply is a tweet
+		// with a parent, forwarded to the parent author's node over the private
+		// tweet route (PUBLIC_POST_REPLY is no longer sent). Federate replies to
+		// the Fediverse; a non-reply tweet is acknowledged without federation.
+		routePostTweet: wrapJSON(func(ctx context.Context, ev tweet) (any, error) {
+			if ev.ParentId == nil || *ev.ParentId == "" {
+				return ev, nil
+			}
+			re := replyEventFromTweet(ev)
+			return replyEcho(re), b.Reply(ctx, re)
+		}),
 		routePostRetweet: wrapJSON(func(ctx context.Context, ev tweet) (any, error) {
 			return ev, b.Announce(ctx, retweeterOf(ev), retweetObject(ev), false)
 		}),
@@ -252,6 +263,26 @@ func replyEcho(ev newReplyEvent) tweet {
 		CreatedAt: ev.CreatedAt,
 		Network:   mastodonNetwork,
 	}
+}
+
+// replyEventFromTweet adapts a reply forwarded over the private tweet route (a
+// tweet carrying a parent) into the reply event the bridge federates. The
+// parent author is derived from the parent note URL by Reply, so only the
+// thread ids, author and text are needed here.
+func replyEventFromTweet(ev tweet) newReplyEvent {
+	re := newReplyEvent{
+		CreatedAt: ev.CreatedAt,
+		Id:        ev.Id,
+		RootId:    ev.RootId,
+		Text:      ev.Text,
+		UserId:    ev.UserId,
+		Username:  ev.Username,
+	}
+	if ev.ParentId != nil {
+		pid := *ev.ParentId
+		re.ParentId = &pid
+	}
+	return re
 }
 
 func retweeterOf(ev tweet) string {
