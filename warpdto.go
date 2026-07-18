@@ -54,6 +54,10 @@ const (
 	routePostRetweet   = event.PUBLIC_POST_RETWEET
 	routePostUnretweet = event.PUBLIC_POST_UNRETWEET
 	routePostReply     = event.PUBLIC_POST_REPLY
+	// routePostTweet is the route warpnet forwards replies over after it
+	// consolidated replies into the tweet path (a reply is a tweet with a
+	// parent); it superseded the standalone PUBLIC_POST_REPLY route.
+	routePostTweet = event.PRIVATE_POST_TWEET
 )
 
 // Wire envelope + domain payloads (warpnet's own types).
