@@ -453,22 +453,15 @@ func (g *gateway) serveOutbox(w http.ResponseWriter, userID string) {
 		items = append(items, g.buildCreateNote(userID, t))
 	}
 
-	// totalItems is the user's authoritative post count: GET_TWEETS is paginated,
-	// so the fetched page is only a slice — reporting its length as the total
-	// (e.g. the page size) understates the real count.
-	total := len(items)
-	if ub, uerr := g.req.request(routeGetUser, getUserEvent{UserId: userID}); uerr == nil {
-		var u user
-		if json.Unmarshal(ub, &u) == nil && u.TweetsCount > 0 {
-			total = int(u.TweetsCount)
-		}
-	}
-
+	// totalItems must match the collection we actually serve: the outbox inlines
+	// only publishable (original top-level) posts, so its count is len(items). The
+	// user's raw TweetsCount includes replies/retweets that are filtered out here,
+	// so reporting it produced "Posts: N" with an empty/short Posts tab.
 	writeJSON(w, contentTypeAP, orderedCollection{
 		Context:      asContext,
 		ID:           id,
 		Type:         "OrderedCollection",
-		TotalItems:   total,
+		TotalItems:   len(items),
 		OrderedItems: items,
 	})
 }

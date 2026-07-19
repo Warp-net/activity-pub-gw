@@ -28,6 +28,7 @@ resulting from the use or misuse of this software.
 package main
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"strconv"
@@ -76,6 +77,13 @@ const (
 	// the set is transient and in memory only).
 	maxClientLimiters = 4096
 	clientLimiterTTL  = 5 * time.Minute
+
+	// drainInterval ticks the global limiter so its sliding window keeps
+	// advancing. The limiter only expires old tasks inside Limit(), but the
+	// middleware fast-429s a locked limiter without calling it — so once the
+	// global budget is exceeded nothing ever reclaims the weight and the whole
+	// data plane stays 429'd until restart. Draining reclaims expired weight.
+	drainInterval = time.Second
 )
 
 // rateLimiters is the gateway's request throttle: one global limiter plus
@@ -119,6 +127,24 @@ func (rl *rateLimiters) client(ip string) *ratelimiter.Limiter {
 	l := ratelimiter.NewLimiter(rl.clientBudget, rl.window, nil)
 	rl.clients.Add(ip, l)
 	return l
+}
+
+// drain keeps the global limiter's sliding window advancing so it can never
+// stay permanently locked. Limit() is the only thing that expires old tasks,
+// but a locked limiter is fast-429'd without calling it (see middleware); this
+// periodic no-op Limit reclaims expired weight. The added weight (1 per tick) is
+// negligible against the global budget. Runs until ctx is cancelled.
+func (rl *rateLimiters) drain(ctx context.Context) {
+	t := time.NewTicker(drainInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			rl.global.Limit(1, func() {})
+		}
+	}
 }
 
 // middleware rejects requests from exhausted clients with 429 + Retry-After
