@@ -41,6 +41,20 @@ func (g *gateway) publishNote(ctx context.Context, localUser string, t tweet) {
 	g.deliverToFollowers(ctx, localUser, g.buildCreateNote(localUser, t), "publish tweet "+t.Id)
 }
 
+// federateTweetAsync fans a gossiped top-level owner tweet out to the author's
+// Fediverse followers without blocking the libp2p gossip ack. The author's node
+// pushes new posts here (PublishUpdateToFollowers over the private tweet route)
+// the moment they are created, so this delivers in real time instead of waiting
+// on the 60s poller — and is idempotent with it, since the Create/Note id is
+// derived from the tweet id, so a duplicate delivery is ignored by the peer.
+func (g *gateway) federateTweetAsync(t tweet) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), acceptDeliveryTimeout)
+		defer cancel()
+		g.publishNote(ctx, t.UserId, t)
+	}()
+}
+
 // sendActorUpdate pushes an Update(Person) to localUser's Fediverse followers so
 // their servers refresh the cached profile (avatar, bio, the Warpnet badge).
 // Mastodon only re-fetches a remote actor on an Update or after its cache goes

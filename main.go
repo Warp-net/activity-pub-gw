@@ -64,7 +64,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.69"
+const gatewayVersion = "0.1.72"
 
 // logRingSize is how many recent log lines the /logs endpoint retains in memory.
 const logRingSize = 2000
@@ -181,6 +181,11 @@ func main() {
 		Handler:           g.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	// Keep the global rate limiter's sliding window advancing: without this it
+	// stays locked forever once the budget is first exceeded (the middleware
+	// fast-429s a locked limiter without ever calling Limit, which is what
+	// reclaims expired weight), taking the whole data plane down until restart.
+	go g.limits.drain(appCtx)
 
 	go func() {
 		log.Infof("gateway: serving Warpnet users at https://%s/users/{id}", host)

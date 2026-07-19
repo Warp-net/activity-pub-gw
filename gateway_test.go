@@ -249,6 +249,44 @@ func TestBridgeDeleteFederatesTombstone(t *testing.T) {
 	}
 }
 
+// TestPublishNoteFederatesTopLevelPost verifies a top-level owner tweet is
+// federated to the author's Fediverse followers as a Create(Note) with a stable,
+// tweet-derived id — the delivery path the gossip push handler drives for BUG-1.
+func TestPublishNoteFederatesTopLevelPost(t *testing.T) {
+	g := testGateway(t)
+	var got map[string]any
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/users/bob":
+			writeJSON(w, contentTypeAP, map[string]any{
+				"id": srv.URL + "/users/bob", "inbox": srv.URL + "/inbox/bob",
+			})
+		case r.URL.Path == "/inbox/bob" && r.Method == http.MethodPost:
+			_ = json.NewDecoder(r.Body).Decode(&got)
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+	if err := g.followers.Add("alice", srv.URL+"/users/bob"); err != nil {
+		t.Fatalf("add follower: %v", err)
+	}
+
+	g.publishNote(context.Background(), "alice", tweet{Id: "01POST0000000000000000000000", UserId: "alice", Text: "hi fediverse"})
+
+	if got["type"] != typeCreate || got["actor"] != g.actorID("alice") {
+		t.Fatalf("activity = %+v", got)
+	}
+	obj, _ := got["object"].(map[string]any)
+	wantID := g.actorID("alice") + pathStatuses + "01POST0000000000000000000000"
+	if obj["type"] != typeNote || obj["id"] != wantID {
+		t.Fatalf("object = %+v, want Note id %s", got["object"], wantID)
+	}
+}
+
 // TestBridgeReplyEmbedsParentInNoteID verifies a federated reply's note id
 // carries the parent url (so serveStatus can later resolve it), the note threads
 // to the real parent, and the Create id stays query-free.
@@ -476,6 +514,110 @@ func TestRateLimitMiddleware(t *testing.T) {
 	}
 	if w := do("/nodeinfo/2.0", "203.0.113.3:1000"); w.Code != http.StatusTooManyRequests {
 		t.Fatalf("media client over budget: status = %d, want 429", w.Code)
+	}
+}
+
+// TestRateLimitGlobalRecovers guards the fix for the global limiter latching
+// locked forever: the middleware fast-429s a locked limiter without calling
+// Limit(), which is the only thing that expires old tasks, so once the global
+// budget is spent the whole data plane stays 429'd until restart. The drain must
+// replace the stuck limiter so it recovers.
+func TestRateLimitGlobalRecovers(t *testing.T) {
+	window := 30 * time.Millisecond
+	rl := newRateLimitersWith(4, 1000, window) // tiny global budget, roomy per-client
+	h := rl.middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	do := func() int {
+		r := httptest.NewRequest(http.MethodGet, "/nodeinfo/2.0", nil) // weight 1, data-plane
+		r.RemoteAddr = "203.0.113.9:1000"
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	for i := 0; i < 4; i++ { // spend the global budget
+		if code := do(); code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200", i+1, code)
+		}
+	}
+	if code := do(); code != http.StatusTooManyRequests {
+		t.Fatalf("over global budget: status = %d, want 429", code)
+	}
+
+	// The window has long passed, but without anything calling Limit() the
+	// limiter never reclaims the weight — this is the latch bug.
+	time.Sleep(window * 3)
+	if code := do(); code != http.StatusTooManyRequests {
+		t.Fatalf("without drain: status = %d, want still-locked 429", code)
+	}
+
+	// The drain goroutine advances the window and unlocks the data plane.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rl.drain(ctx)
+
+	recovered := false
+	for i := 0; i < 40; i++ { // up to ~2s (drainInterval is 1s)
+		if do() == http.StatusOK {
+			recovered = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !recovered {
+		t.Fatal("global limiter never recovered after drain")
+	}
+}
+
+// TestRateLimitClientRecovers guards the same latch fix for per-client limiters:
+// a client that trips its budget is fast-429'd without calling Limit(), and its
+// LRU entry's TTL is refreshed on every request, so it would stay locked forever.
+// The drain must replace the stuck client limiter so it recovers.
+func TestRateLimitClientRecovers(t *testing.T) {
+	window := 30 * time.Millisecond
+	rl := newRateLimitersWith(1_000_000, 4, window) // roomy global, tiny per-client
+	h := rl.middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	do := func() int {
+		r := httptest.NewRequest(http.MethodGet, "/nodeinfo/2.0", nil) // weight 1
+		r.RemoteAddr = "203.0.113.7:1000"
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	for i := 0; i < 4; i++ { // spend the client's budget
+		if code := do(); code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200", i+1, code)
+		}
+	}
+	if code := do(); code != http.StatusTooManyRequests {
+		t.Fatalf("over client budget: status = %d, want 429", code)
+	}
+
+	// The window has passed, but the client keeps 429'ing and its TTL is
+	// refreshed, so nothing reclaims its weight — the latch bug.
+	time.Sleep(window * 3)
+	if code := do(); code != http.StatusTooManyRequests {
+		t.Fatalf("without drain: status = %d, want still-locked 429", code)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rl.drain(ctx)
+
+	recovered := false
+	for i := 0; i < 40; i++ { // up to ~2s (drainInterval is 1s)
+		if do() == http.StatusOK {
+			recovered = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !recovered {
+		t.Fatal("client limiter never recovered after drain")
 	}
 }
 

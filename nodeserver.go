@@ -130,10 +130,15 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 		}),
 		// Warpnet consolidated replies into the tweet path: a reply is a tweet
 		// with a parent, forwarded to the parent author's node over the private
-		// tweet route (PUBLIC_POST_REPLY is no longer sent). Federate replies to
-		// the Fediverse; a non-reply tweet is acknowledged without federation.
+		// tweet route (PUBLIC_POST_REPLY is no longer sent). Federate replies as
+		// AP replies; a top-level owner post arrives here via follower gossip, so
+		// federate it to the author's Fediverse followers in real time (the poller
+		// is a slower backstop; delivery is idempotent by Create/Note id).
 		routePostTweet: wrapJSON(func(ctx context.Context, ev tweet) (any, error) {
 			if ev.ParentId == nil || *ev.ParentId == "" {
+				if publishableTweet(ev, ev.UserId) {
+					g.federateTweetAsync(ev)
+				}
 				return ev, nil
 			}
 			re := replyEventFromTweet(ev)
