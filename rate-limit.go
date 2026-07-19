@@ -55,11 +55,15 @@ const (
 	rateWindow = time.Minute
 
 	// perClientBudget: weight units one client IP may spend per window
-	// (~60 actor lookups, ~30 collections, or ~15 media fetches a minute).
-	perClientBudget uint32 = 120
+	// (~600 actor lookups, ~300 collections, or ~150 media fetches a minute).
+	// A busy instance legitimately bursts well past a hundred fetches when it
+	// discovers a new actor (actor+webfinger+outbox+followers+following+avatar+
+	// header) and then dereferences a thread's statuses, so a low budget 429s
+	// real peers mid-resolve and the note/profile never renders.
+	perClientBudget uint32 = 1200
 	// globalBudget bounds gateway-wide spend per window regardless of how
 	// many client IPs the traffic comes from.
-	globalBudget uint32 = 600
+	globalBudget uint32 = 6000
 
 	weightStatic     uint32 = 1
 	weightActor      uint32 = 2
