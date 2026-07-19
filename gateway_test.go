@@ -520,8 +520,8 @@ func TestRateLimitMiddleware(t *testing.T) {
 // TestRateLimitGlobalRecovers guards the fix for the global limiter latching
 // locked forever: the middleware fast-429s a locked limiter without calling
 // Limit(), which is the only thing that expires old tasks, so once the global
-// budget is spent the whole data plane stays 429'd until restart. The drain
-// goroutine must keep the window advancing so it recovers.
+// budget is spent the whole data plane stays 429'd until restart. The drain must
+// replace the stuck limiter so it recovers.
 func TestRateLimitGlobalRecovers(t *testing.T) {
 	window := 30 * time.Millisecond
 	rl := newRateLimitersWith(4, 1000, window) // tiny global budget, roomy per-client
@@ -573,7 +573,7 @@ func TestRateLimitGlobalRecovers(t *testing.T) {
 // TestRateLimitClientRecovers guards the same latch fix for per-client limiters:
 // a client that trips its budget is fast-429'd without calling Limit(), and its
 // LRU entry's TTL is refreshed on every request, so it would stay locked forever.
-// The drain goroutine must advance the client's window so it recovers.
+// The drain must replace the stuck client limiter so it recovers.
 func TestRateLimitClientRecovers(t *testing.T) {
 	window := 30 * time.Millisecond
 	rl := newRateLimitersWith(1_000_000, 4, window) // roomy global, tiny per-client

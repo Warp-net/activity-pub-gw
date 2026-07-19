@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ratelimiter "github.com/filinvadim/ratelimiter"
@@ -78,12 +79,9 @@ const (
 	maxClientLimiters = 4096
 	clientLimiterTTL  = 5 * time.Minute
 
-	// drainInterval ticks the global limiter so its sliding window keeps
-	// advancing. The limiter only expires old tasks inside Limit(), but the
-	// middleware fast-429s a locked limiter without calling it — so once the
-	// global budget is exceeded nothing ever reclaims the weight and the whole
-	// data plane stays 429'd until restart. Draining reclaims expired weight.
-	drainInterval = time.Second
+	// drainInterval is how often the drain checks for a limiter that has been
+	// stuck locked (see drain).
+	drainInterval = 500 * time.Millisecond
 )
 
 // rateLimiters is the gateway's request throttle: one global limiter plus
@@ -91,12 +89,11 @@ const (
 type rateLimiters struct {
 	window       time.Duration
 	clientBudget uint32
-	global       *ratelimiter.Limiter
+	globalBudget uint32
+	global       atomic.Pointer[ratelimiter.Limiter] // swapped out by drain when stuck
 
 	mu      sync.Mutex // serializes get-or-create on clients
 	clients *expirable.LRU[string, *ratelimiter.Limiter]
-
-	draining sync.Map // client IP -> a drain goroutine is in flight for it
 }
 
 func newRateLimiters() *rateLimiters {
@@ -106,14 +103,16 @@ func newRateLimiters() *rateLimiters {
 // newRateLimitersWith parameterizes the budgets/window so tests can exercise
 // the middleware without spending 120 requests per case.
 func newRateLimitersWith(global, perClient uint32, window time.Duration) *rateLimiters {
-	return &rateLimiters{
+	rl := &rateLimiters{
 		window:       window,
 		clientBudget: perClient,
-		global:       ratelimiter.NewLimiter(global, window, nil),
+		globalBudget: global,
 		clients: expirable.NewLRU(maxClientLimiters,
 			func(_ string, l *ratelimiter.Limiter) { l.Close() },
 			clientLimiterTTL),
 	}
+	rl.global.Store(ratelimiter.NewLimiter(global, window, nil))
+	return rl
 }
 
 func (rl *rateLimiters) client(ip string) *ratelimiter.Limiter {
@@ -131,45 +130,76 @@ func (rl *rateLimiters) client(ip string) *ratelimiter.Limiter {
 	return l
 }
 
-// drain keeps the global and per-client limiters' sliding windows advancing so
-// they can never stay permanently locked. Limit() is the only thing that expires
-// old tasks, but a locked limiter is fast-429'd without calling it (see
-// middleware); this periodic no-op Limit reclaims expired weight. The added
-// weight (1 per tick) is negligible against the budgets. Runs until ctx is
-// cancelled.
+// drain recovers a limiter that has latched permanently locked. The library only
+// expires old tasks inside Limit(), but the middleware fast-429s a locked limiter
+// without calling it, so once a budget is exceeded nothing ever reclaims the
+// weight: the global limiter stays 429'd until restart (whole data plane down),
+// and a per-client limiter never evicts because client() refreshes its LRU TTL on
+// every request. While a limiter is locked the middleware 429s every request, so
+// no weight is spent — meaning after one window its sliding window is logically
+// empty. drain detects a limiter that has stayed locked for a full window and
+// replaces it with a fresh one. It never calls Limit(), so it can't race with the
+// middleware on the (unsynchronised) task queue. Runs until ctx is cancelled.
 func (rl *rateLimiters) drain(ctx context.Context) {
 	t := time.NewTicker(drainInterval)
 	defer t.Stop()
+	// lockedSince is drain-local (single goroutine), so it needs no synchronising.
+	var globalLockedSince time.Time
+	clientLockedSince := map[string]time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			rl.global.Limit(1, func() {})
-			rl.drainClients()
+		case now := <-t.C:
+			globalLockedSince = rl.resetGlobalIfStuck(globalLockedSince, now)
+			rl.resetStuckClients(clientLockedSince, now)
 		}
 	}
 }
 
-// drainClients advances the window of every currently-locked per-client limiter.
-// A client that trips its budget would otherwise stay locked forever: the
-// middleware fast-429s it without calling Limit(), and client() refreshes the
-// LRU TTL on every request, so a busy locked client is never evicted either. Each
-// locked client is ticked in its own goroutine (Limit blocks until that client's
-// window advances), guarded so at most one drainer runs per client at a time.
-func (rl *rateLimiters) drainClients() {
+// resetGlobalIfStuck swaps in a fresh global limiter once the current one has
+// been continuously locked for a full window, returning the updated lockedSince.
+func (rl *rateLimiters) resetGlobalIfStuck(lockedSince, now time.Time) time.Time {
+	if !rl.global.Load().IsLocked() {
+		return time.Time{}
+	}
+	if lockedSince.IsZero() {
+		return now
+	}
+	if now.Sub(lockedSince) >= rl.window {
+		rl.global.Store(ratelimiter.NewLimiter(rl.globalBudget, rl.window, nil))
+		return time.Time{}
+	}
+	return lockedSince
+}
+
+// resetStuckClients replaces any per-client limiter that has been locked for a
+// full window with a fresh one. lockedSince tracks per-IP first-seen-locked times
+// and is pruned as clients recover or leave the LRU.
+func (rl *rateLimiters) resetStuckClients(lockedSince map[string]time.Time, now time.Time) {
+	present := make(map[string]struct{})
 	for _, ip := range rl.clients.Keys() {
 		lim, ok := rl.clients.Peek(ip) // Peek: don't refresh the entry's TTL
 		if !ok || !lim.IsLocked() {
 			continue
 		}
-		if _, busy := rl.draining.LoadOrStore(ip, struct{}{}); busy {
+		present[ip] = struct{}{}
+		since, seen := lockedSince[ip]
+		if !seen {
+			lockedSince[ip] = now
 			continue
 		}
-		go func(ip string, l *ratelimiter.Limiter) {
-			defer rl.draining.Delete(ip)
-			l.Limit(1, func() {})
-		}(ip, lim)
+		if now.Sub(since) >= rl.window {
+			rl.mu.Lock()
+			rl.clients.Add(ip, ratelimiter.NewLimiter(rl.clientBudget, rl.window, nil))
+			rl.mu.Unlock()
+			delete(lockedSince, ip)
+		}
+	}
+	for ip := range lockedSince { // drop clients that recovered or aged out
+		if _, ok := present[ip]; !ok {
+			delete(lockedSince, ip)
+		}
 	}
 }
 
@@ -186,7 +216,8 @@ func (rl *rateLimiters) middleware(next http.Handler) http.Handler {
 		// global budget must never lock it out (that breaks follow/reply/like).
 		// The per-client budget still applies, so a single abusive IP is capped.
 		ctrl := isControlPlane(r.URL.Path)
-		if lim.IsLocked() || (!ctrl && rl.global.IsLocked()) {
+		global := rl.global.Load()
+		if lim.IsLocked() || (!ctrl && global.IsLocked()) {
 			w.Header().Set("Retry-After", strconv.Itoa(int(rl.window/time.Second)))
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
@@ -198,7 +229,7 @@ func (rl *rateLimiters) middleware(next http.Handler) http.Handler {
 			})
 			return
 		}
-		rl.global.Limit(weight, func() {
+		global.Limit(weight, func() {
 			lim.Limit(weight, func() {
 				next.ServeHTTP(w, r)
 			})
