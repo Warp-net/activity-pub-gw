@@ -570,6 +570,57 @@ func TestRateLimitGlobalRecovers(t *testing.T) {
 	}
 }
 
+// TestRateLimitClientRecovers guards the same latch fix for per-client limiters:
+// a client that trips its budget is fast-429'd without calling Limit(), and its
+// LRU entry's TTL is refreshed on every request, so it would stay locked forever.
+// The drain goroutine must advance the client's window so it recovers.
+func TestRateLimitClientRecovers(t *testing.T) {
+	window := 30 * time.Millisecond
+	rl := newRateLimitersWith(1_000_000, 4, window) // roomy global, tiny per-client
+	h := rl.middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	do := func() int {
+		r := httptest.NewRequest(http.MethodGet, "/nodeinfo/2.0", nil) // weight 1
+		r.RemoteAddr = "203.0.113.7:1000"
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	for i := 0; i < 4; i++ { // spend the client's budget
+		if code := do(); code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200", i+1, code)
+		}
+	}
+	if code := do(); code != http.StatusTooManyRequests {
+		t.Fatalf("over client budget: status = %d, want 429", code)
+	}
+
+	// The window has passed, but the client keeps 429'ing and its TTL is
+	// refreshed, so nothing reclaims its weight — the latch bug.
+	time.Sleep(window * 3)
+	if code := do(); code != http.StatusTooManyRequests {
+		t.Fatalf("without drain: status = %d, want still-locked 429", code)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rl.drain(ctx)
+
+	recovered := false
+	for i := 0; i < 40; i++ { // up to ~2s (drainInterval is 1s)
+		if do() == http.StatusOK {
+			recovered = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !recovered {
+		t.Fatal("client limiter never recovered after drain")
+	}
+}
+
 func TestRequestWeight(t *testing.T) {
 	cases := map[string]uint32{
 		"/nodeinfo/2.0":              weightStatic,

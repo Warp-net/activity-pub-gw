@@ -95,6 +95,8 @@ type rateLimiters struct {
 
 	mu      sync.Mutex // serializes get-or-create on clients
 	clients *expirable.LRU[string, *ratelimiter.Limiter]
+
+	draining sync.Map // client IP -> a drain goroutine is in flight for it
 }
 
 func newRateLimiters() *rateLimiters {
@@ -129,11 +131,12 @@ func (rl *rateLimiters) client(ip string) *ratelimiter.Limiter {
 	return l
 }
 
-// drain keeps the global limiter's sliding window advancing so it can never
-// stay permanently locked. Limit() is the only thing that expires old tasks,
-// but a locked limiter is fast-429'd without calling it (see middleware); this
-// periodic no-op Limit reclaims expired weight. The added weight (1 per tick) is
-// negligible against the global budget. Runs until ctx is cancelled.
+// drain keeps the global and per-client limiters' sliding windows advancing so
+// they can never stay permanently locked. Limit() is the only thing that expires
+// old tasks, but a locked limiter is fast-429'd without calling it (see
+// middleware); this periodic no-op Limit reclaims expired weight. The added
+// weight (1 per tick) is negligible against the budgets. Runs until ctx is
+// cancelled.
 func (rl *rateLimiters) drain(ctx context.Context) {
 	t := time.NewTicker(drainInterval)
 	defer t.Stop()
@@ -143,7 +146,30 @@ func (rl *rateLimiters) drain(ctx context.Context) {
 			return
 		case <-t.C:
 			rl.global.Limit(1, func() {})
+			rl.drainClients()
 		}
+	}
+}
+
+// drainClients advances the window of every currently-locked per-client limiter.
+// A client that trips its budget would otherwise stay locked forever: the
+// middleware fast-429s it without calling Limit(), and client() refreshes the
+// LRU TTL on every request, so a busy locked client is never evicted either. Each
+// locked client is ticked in its own goroutine (Limit blocks until that client's
+// window advances), guarded so at most one drainer runs per client at a time.
+func (rl *rateLimiters) drainClients() {
+	for _, ip := range rl.clients.Keys() {
+		lim, ok := rl.clients.Peek(ip) // Peek: don't refresh the entry's TTL
+		if !ok || !lim.IsLocked() {
+			continue
+		}
+		if _, busy := rl.draining.LoadOrStore(ip, struct{}{}); busy {
+			continue
+		}
+		go func(ip string, l *ratelimiter.Limiter) {
+			defer rl.draining.Delete(ip)
+			l.Limit(1, func() {})
+		}(ip, lim)
 	}
 }
 
