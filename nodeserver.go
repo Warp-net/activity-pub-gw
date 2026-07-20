@@ -192,7 +192,7 @@ func (c *nodeClient) streamHandler(route string, h routeHandler) network.StreamH
 		}
 		if conn := s.Conn(); conn != nil {
 			pub := warpnet.FromIDToPubKey(conn.RemotePeer())
-			if verr := security.VerifySignature(pub, msg.Body, msg.Signature); verr != nil {
+			if verr := security.VerifySignature(pub, signingInput(msg.Body, msg.Timestamp), msg.Signature); verr != nil {
 				log.Warnf("nodeserver: %s: signature from %s invalid: %v", route, conn.RemotePeer(), verr)
 				return
 			}
