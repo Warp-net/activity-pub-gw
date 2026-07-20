@@ -38,6 +38,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"fmt"
+	"strconv"
 	"time"
 
 	wjson "github.com/Warp-net/warpnet/json"
@@ -105,14 +106,15 @@ func streamSend(ctx context.Context, h host.Host, p peer.ID, priv ed25519.Privat
 	}
 	defer func() { _ = s.Close() }()
 
+	ts := time.Now()
 	data, err := wjson.Marshal(message{
 		Body:        wjson.RawMessage(body),
 		MessageId:   uuid.New().String(),
 		NodeId:      h.ID().String(),
 		Destination: route,
-		Timestamp:   time.Now(),
+		Timestamp:   ts,
 		Version:     "0.0.0",
-		Signature:   security.Sign(priv, body),
+		Signature:   security.Sign(priv, signingInput(body, ts)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("stream: marshal envelope: %w", err)
@@ -132,4 +134,15 @@ func streamSend(ctx context.Context, h host.Host, p peer.ID, priv ed25519.Privat
 		return nil, fmt.Errorf("stream: read: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// signingInput mirrors warpnet's event.Message.SigningBytes: the raw body
+// followed by the timestamp as decimal Unix nanoseconds. Keep in sync with the
+// node until the pinned warpnet exposes Message.SigningBytes.
+func signingInput(body []byte, ts time.Time) []byte {
+	n := strconv.FormatInt(ts.UnixNano(), 10)
+	buf := make([]byte, 0, len(body)+len(n))
+	buf = append(buf, body...)
+	buf = append(buf, n...)
+	return buf
 }
