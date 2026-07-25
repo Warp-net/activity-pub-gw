@@ -33,13 +33,13 @@ package main
 
 // ActivityPub activity/object type names the gateway emits or matches.
 const (
-	typeCreate   = "Create"
-	typeUpdate   = "Update"
-	typeLike     = "Like"
-	typeFollow   = "Follow"
-	typeUndo     = "Undo"
-	typeNote     = "Note"
-	typeAnnounce = "Announce"
+	typeCreate    = "Create"
+	typeUpdate    = "Update"
+	typeLike      = "Like"
+	typeFollow    = "Follow"
+	typeUndo      = "Undo"
+	typeNote      = "Note"
+	typeAnnounce  = "Announce"
 	typeDelete    = "Delete"
 	typeDocument  = "Document"
 	typeTombstone = "Tombstone"
