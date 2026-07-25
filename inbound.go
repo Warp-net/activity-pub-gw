@@ -174,6 +174,10 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 // parseLocalStatus extracts the owner username and tweet id from one of our own
 // status URLs (https://host/users/{user}/statuses/{id}).
 func (g *gateway) parseLocalStatus(statusURL string) (owner, tweetID string, ok bool) {
+	// A federated reply id carries "?parent=..." (see b.Reply); the encoded parent
+	// contains no bare '/', so drop the query/fragment before splitting the path.
+	statusURL, _, _ = strings.Cut(statusURL, "#")
+	statusURL, _, _ = strings.Cut(statusURL, "?")
 	rest, found := strings.CutPrefix(statusURL, g.baseURL()+pathUsers)
 	if !found {
 		return "", "", false

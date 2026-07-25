@@ -898,13 +898,16 @@ func (b *mastodonBridge) Delete(ctx context.Context, ev deleteTweetRequest) erro
 	author := asString(obj["attributedTo"])
 	localUser := ev.UserId
 	actorID := b.ap.actorID(localUser)
-	noteID := actorID + pathStatuses + ev.TweetId
+	noteURL := actorID + pathStatuses + ev.TweetId
+	// The Tombstone id must be byte-identical to the note id b.Reply federated
+	// (which carries the parent url), or Mastodon can't find the status to drop.
+	replyURL := noteURL + "?" + url.Values{replyParentQuery: {parentURL}}.Encode()
 	del := activity{
 		Context: asContext,
-		ID:      noteID + "#delete",
+		ID:      noteURL + "#delete",
 		Type:    typeDelete,
 		Actor:   actorID,
-		Object:  tombstone{ID: noteID, Type: typeTombstone},
+		Object:  tombstone{ID: replyURL, Type: typeTombstone},
 		To:      []string{author},
 		Cc:      []string{asPublic},
 	}

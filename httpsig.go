@@ -111,60 +111,62 @@ func signRequest(req *http.Request, keyID string, key *rsa.PrivateKey, body []by
 // already-read request body; fetchKey resolves a keyId to its RSA public key
 // (by dereferencing the signing actor's document). The library verifies the
 // signature itself; the checks below are policy it leaves to the caller.
-func verifyRequest(req *http.Request, body []byte, fetchKey func(keyID string) (*rsa.PublicKey, error)) error {
+// On success it returns the verified keyId so the caller can bind it to the
+// activity's actor.
+func verifyRequest(req *http.Request, body []byte, fetchKey func(keyID string) (*rsa.PublicKey, error)) (string, error) {
 	sigHdr := req.Header.Get("Signature")
 	if sigHdr == "" {
-		return errNoSignatureHeader
+		return "", errNoSignatureHeader
 	}
 	_, headers, _, err := parseSignatureHeader(sigHdr)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	// Enforce the minimum signed header set required for ActivityPub.
 	for _, required := range minSignedHeaders {
 		if !slices.Contains(headers, required) {
-			return fmt.Errorf("httpsig: %q not signed: %w", required, errIncompleteSignature)
+			return "", fmt.Errorf("httpsig: %q not signed: %w", required, errIncompleteSignature)
 		}
 	}
 	// Date must be present and recent: signing over an absent/empty date
 	// weakens replay protection.
 	dateStr := req.Header.Get(headerDate)
 	if dateStr == "" {
-		return fmt.Errorf("httpsig: missing Date header: %w", errIncompleteSignature)
+		return "", fmt.Errorf("httpsig: missing Date header: %w", errIncompleteSignature)
 	}
 	when, derr := http.ParseTime(dateStr)
 	if derr != nil {
-		return fmt.Errorf("httpsig: bad Date header: %w", errIncompleteSignature)
+		return "", fmt.Errorf("httpsig: bad Date header: %w", errIncompleteSignature)
 	}
 	if skew := time.Since(when); skew > maxClockSkew || skew < -maxClockSkew {
-		return errStaleRequest
+		return "", errStaleRequest
 	}
 	// A request carrying a body MUST bind it via a signed digest, otherwise a
 	// tampered body would still verify.
 	if len(body) > 0 && !slices.Contains(headers, digestHeader) {
-		return fmt.Errorf("httpsig: body not bound by digest: %w", errIncompleteSignature)
+		return "", fmt.Errorf("httpsig: body not bound by digest: %w", errIncompleteSignature)
 	}
 	if slices.Contains(headers, digestHeader) {
 		sum := sha256.Sum256(body)
 		want := "SHA-256=" + base64.StdEncoding.EncodeToString(sum[:])
 		if req.Header.Get("Digest") != want {
-			return errDigestMismatch
+			return "", errDigestMismatch
 		}
 	}
 
 	v, err := httpsig.NewVerifier(req)
 	if err != nil {
-		return fmt.Errorf("httpsig: new verifier: %w", err)
+		return "", fmt.Errorf("httpsig: new verifier: %w", err)
 	}
 	pub, err := fetchKey(v.KeyId())
 	if err != nil {
-		return fmt.Errorf("httpsig: fetch key %q: %w", v.KeyId(), err)
+		return "", fmt.Errorf("httpsig: fetch key %q: %w", v.KeyId(), err)
 	}
 	if err := v.Verify(pub, httpsig.RSA_SHA256); err != nil {
-		return fmt.Errorf("httpsig: verify: %w", err)
+		return "", fmt.Errorf("httpsig: verify: %w", err)
 	}
-	return nil
+	return v.KeyId(), nil
 }
 
 func parseSignatureHeader(v string) (keyID string, headers []string, signature string, err error) {
