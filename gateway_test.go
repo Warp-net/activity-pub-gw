@@ -120,12 +120,12 @@ func TestHTTPSignatureRoundTrip(t *testing.T) {
 
 	pubKey := func(string) (*rsa.PublicKey, error) { return &g.key.PublicKey, nil }
 
-	if err := verifyRequest(req, body, pubKey); err != nil {
+	if _, err := verifyRequest(req, body, pubKey); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 
 	t.Run("tampered body fails", func(t *testing.T) {
-		if err := verifyRequest(req, []byte(`{"type":"Undo"}`), pubKey); err == nil {
+		if _, err := verifyRequest(req, []byte(`{"type":"Undo"}`), pubKey); err == nil {
 			t.Fatal("expected digest mismatch, got nil")
 		}
 	})
@@ -243,7 +243,8 @@ func TestBridgeDeleteFederatesTombstone(t *testing.T) {
 		t.Fatalf("activity = %+v", got)
 	}
 	obj, _ := got["object"].(map[string]any)
-	wantID := g.actorID("alice") + pathStatuses + "01REPLY00000000000000000000"
+	wantID := g.actorID("alice") + pathStatuses + "01REPLY00000000000000000000" +
+		"?" + url.Values{replyParentQuery: {srv.URL + "/note"}}.Encode()
 	if obj["type"] != typeTombstone || obj["id"] != wantID {
 		t.Fatalf("object = %+v, want Tombstone id %s", got["object"], wantID)
 	}
@@ -1691,5 +1692,17 @@ func TestGetTweetsIgnoresDatastoreCursor(t *testing.T) {
 	}
 	if len(resp.Tweets) != 1 || resp.Tweets[0].Id != srv.URL+"/statuses/1" {
 		t.Fatalf("tweets = %+v, want first-page note", resp.Tweets)
+	}
+}
+
+// A federated reply id carries "?parent=<encoded url>"; the query must not leak
+// into the tweet id or inbound Like/Announce/Undo against it are dropped.
+func TestParseLocalStatusReplyParentQuery(t *testing.T) {
+	g := testGateway(t) // host gw.example
+	parent := "https://mastodon.social/users/bob/statuses/123"
+	statusURL := "https://gw.example/users/alice/statuses/r1?" + url.Values{replyParentQuery: {parent}}.Encode()
+	owner, tweetID, ok := g.parseLocalStatus(statusURL)
+	if !ok || owner != "alice" || tweetID != "r1" {
+		t.Fatalf("parseLocalStatus(%q) = %q, %q, %v", statusURL, owner, tweetID, ok)
 	}
 }

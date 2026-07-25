@@ -29,6 +29,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 )
 
 // nodeRequester is the subset of nodeClient that the follower store needs.
@@ -49,30 +50,70 @@ type nodeFollowerStore struct {
 	req nodeRequester
 }
 
+const (
+	followersPageSize = uint64(100)
+	followersMaxPages = 100
+)
+
+// nodeResponseError reports a node handler failure: warpnet streams
+// event.ResponseError as an ordinary response, so a nil transport error says
+// nothing about success and an unchecked body decodes as an empty result.
+func nodeResponseError(bt []byte) error {
+	var possibleError struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(bt, &possibleError); err != nil {
+		return nil // not an error envelope — let the caller decode it
+	}
+	if possibleError.Message == "" {
+		return nil
+	}
+	return fmt.Errorf("node: %d %s", possibleError.Code, possibleError.Message)
+}
+
 func (s nodeFollowerStore) Add(localUser, actorURL string) error {
-	_, err := s.req.requestUser(localUser, routePostFollow, newFollowEvent{
+	bt, err := s.req.requestUser(localUser, routePostFollow, newFollowEvent{
 		FollowerId:  encodeActorID(actorURL),
 		FollowingId: localUser,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return nodeResponseError(bt)
 }
 
 func (s nodeFollowerStore) List(localUser string) ([]string, error) {
-	bt, err := s.req.requestUser(localUser, routeGetFollowers, getFollowersEvent{UserId: localUser})
-	if err != nil {
-		return nil, err
-	}
-	var resp followersResponse
-	if err := json.Unmarshal(bt, &resp); err != nil {
-		return nil, err
-	}
-	urls := make([]string, 0, len(resp.Followers))
-	for _, id := range resp.Followers {
-		actorURL, derr := decodeActorID(id)
-		if derr != nil {
-			continue // native Warpnet follower id, not an AP actor — skip
+	limit := followersPageSize
+	var cursor string
+	urls := make([]string, 0, limit)
+	for range followersMaxPages {
+		ev := getFollowersEvent{UserId: localUser, Limit: &limit}
+		if cursor != "" {
+			ev.Cursor = &cursor
 		}
-		urls = append(urls, actorURL)
+		bt, err := s.req.requestUser(localUser, routeGetFollowers, ev)
+		if err != nil {
+			return nil, err
+		}
+		if err := nodeResponseError(bt); err != nil {
+			return nil, err
+		}
+		var resp followersResponse
+		if err := json.Unmarshal(bt, &resp); err != nil {
+			return nil, err
+		}
+		for _, id := range resp.Followers {
+			actorURL, derr := decodeActorID(id)
+			if derr != nil {
+				continue // native Warpnet follower id, not an AP actor — skip
+			}
+			urls = append(urls, actorURL)
+		}
+		if len(resp.Followers) == 0 || resp.Cursor == "" || resp.Cursor == cursor {
+			break
+		}
+		cursor = resp.Cursor
 	}
 	return urls, nil
 }

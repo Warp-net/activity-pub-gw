@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -57,9 +58,10 @@ func (g *gateway) handleInbox(w http.ResponseWriter, r *http.Request, user strin
 		http.Error(w, "read body", http.StatusBadRequest)
 		return
 	}
-	if err := verifyRequest(r, body, func(keyID string) (*rsa.PublicKey, error) {
+	keyID, err := verifyRequest(r, body, func(keyID string) (*rsa.PublicKey, error) {
 		return g.fetchKey(r.Context(), keyID)
-	}); err != nil {
+	})
+	if err != nil {
 		log.Warnf("inbox: signature verification failed: %v", err)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
@@ -71,7 +73,14 @@ func (g *gateway) handleInbox(w http.ResponseWriter, r *http.Request, user strin
 		return
 	}
 	typ, _ := raw[keyType].(string)
-	remoteActor, _ := raw[keyActor].(string)
+	remoteActor := stringField(raw, keyActor)
+	// The signer owns the activity: an authenticated peer must not speak for
+	// another actor.
+	if signer, _, _ := strings.Cut(keyID, "#"); signer != remoteActor {
+		log.Warnf("inbox: actor %q does not match signer %q", remoteActor, signer)
+		http.Error(w, "actor does not match signature", http.StatusForbidden)
+		return
+	}
 	log.Infof("inbox: %s from %s", typ, remoteActor)
 
 	switch typ {

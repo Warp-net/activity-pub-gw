@@ -137,6 +137,9 @@ func (p *followPoller) poll() error {
 	if err != nil {
 		return err
 	}
+	if err := nodeResponseError(bt); err != nil {
+		return err
+	}
 	var resp followingsResponse
 	if err := json.Unmarshal(bt, &resp); err != nil {
 		return err
@@ -151,6 +154,12 @@ func (p *followPoller) poll() error {
 
 	if p.known == nil { // baseline only — don't replay existing follows
 		p.known = current
+		return nil
+	}
+	if len(current) == 0 && len(p.known) > 0 {
+		// A read failure is far likelier than every follow vanishing at once;
+		// skip the round rather than mass-unfollow on remote instances.
+		log.Warnf("follow poll: %s: followings went empty (had %d) — skipping round", p.owner, len(p.known))
 		return nil
 	}
 	for actorURL := range current {
