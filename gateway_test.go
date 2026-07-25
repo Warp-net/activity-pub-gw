@@ -1706,3 +1706,49 @@ func TestParseLocalStatusReplyParentQuery(t *testing.T) {
 		t.Fatalf("parseLocalStatus(%q) = %q, %q, %v", statusURL, owner, tweetID, ok)
 	}
 }
+
+// A Fediverse follower reaches warpnet as an "ap:" id (base64url of the actor
+// URL), and warpnet asks for that profile with the id verbatim. The bridge must
+// decode it to the actor URL instead of trying to WebFinger it as a handle,
+// otherwise the UI renders the raw id.
+func TestGetUserResolvesAPFollowerID(t *testing.T) {
+	g := testGateway(t)
+	var srv *httptest.Server
+	var webfingered bool
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/users/warpnet":
+			writeJSON(w, contentTypeAP, map[string]any{
+				"id": srv.URL + "/users/warpnet", "type": "Person",
+				"preferredUsername": "warpnet", "name": "Warpnet",
+				"summary": "<p>bio</p>",
+			})
+		case "/.well-known/webfinger":
+			webfingered = true
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	g.client = srv.Client()
+
+	b := newMastodonBridge(g, "node1")
+	id := encodeActorID(srv.URL + "/users/warpnet")
+	u, err := b.GetUserBrief(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetUserBrief(%q): %v", id, err)
+	}
+	if webfingered {
+		t.Errorf("ap: id was webfingered; it already carries the actor URL")
+	}
+	if u.Username != "Warpnet" {
+		t.Errorf("Username = %q, want the resolved actor name", u.Username)
+	}
+	if u.Website == nil || *u.Website != srv.URL+"/users/warpnet" {
+		t.Errorf("Website = %v, want the actor URL", u.Website)
+	}
+	if u.Id != id {
+		t.Errorf("Id = %q, want the requested id %q", u.Id, id)
+	}
+}

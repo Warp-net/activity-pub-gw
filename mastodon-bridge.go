@@ -70,8 +70,13 @@ func newMastodonBridge(ap apTransport, nodeID string) *mastodonBridge {
 	return &mastodonBridge{ap: ap, nodeID: nodeID}
 }
 
-// resolveHandle resolves "name@instance" to its actor URL via WebFinger.
+// resolveHandle resolves "name@instance" to its actor URL via WebFinger. An
+// "ap:" id (a remote actor Warpnet learned about through the follow graph)
+// already carries its actor URL, so it is decoded instead of WebFingered.
 func (b *mastodonBridge) resolveHandle(ctx context.Context, handle string) (string, error) {
+	if actorURL, derr := decodeActorID(handle); derr == nil {
+		return actorURL, nil
+	}
 	name, instance, ok := strings.Cut(strings.TrimPrefix(handle, "@"), "@")
 	if !ok || name == "" || instance == "" {
 		return "", fmt.Errorf("mastodon: %q is not a name@instance handle", handle)
