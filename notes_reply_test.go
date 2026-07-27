@@ -82,6 +82,27 @@ func TestReplyEventFromTweet(t *testing.T) {
 	}
 }
 
+// TestMentionOf verifies a federated reply carries a Mention of the parent
+// author: without it Mastodon threads the reply but never notifies them.
+func TestMentionOf(t *testing.T) {
+	author := "https://mastodon.social/users/warpnet"
+	parent := "https://mastodon.social/users/warpnet/statuses/116827782393402363"
+
+	tags := mentionOf(author, parent)
+	if len(tags) != 1 {
+		t.Fatalf("tags = %+v, want one Mention", tags)
+	}
+	if tags[0].Type != typeMention || tags[0].Href != author {
+		t.Fatalf("tag = %+v, want Mention of %q", tags[0], author)
+	}
+	if want := "@warpnet@mastodon.social"; tags[0].Name != want {
+		t.Fatalf("Name = %q, want %q", tags[0].Name, want)
+	}
+	if got := mentionOf("", parent); got != nil {
+		t.Fatalf("unknown author: tags = %+v, want nil", got)
+	}
+}
+
 // TestServeRepliesUsesTweetsAPI verifies the replies collection is sourced from
 // PUBLIC_GET_TWEETS with the note as parent_id (warpnet retired the standalone
 // PUBLIC_GET_REPLIES route), and that fediverse-authored replies are skipped.

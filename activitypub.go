@@ -43,6 +43,7 @@ const (
 	typeDelete    = "Delete"
 	typeDocument  = "Document"
 	typeTombstone = "Tombstone"
+	typeMention   = "Mention"
 )
 
 // tombstone is the object of an outbound Delete: it names the deleted Note by id
@@ -143,7 +144,18 @@ type note struct {
 	InReplyTo    string       `json:"inReplyTo,omitempty"`
 	To           []string     `json:"to,omitempty"`
 	Cc           []string     `json:"cc,omitempty"`
+	Tag          []mentionTag `json:"tag,omitempty"`
 	Attachment   []attachment `json:"attachment,omitempty"`
+}
+
+// mentionTag is an ActivityPub Mention. Addressing the parent author in `to`
+// delivers a reply and threads it, but Mastodon only raises a notification for
+// them when the note also mentions them — without this the reply lands in the
+// thread silently.
+type mentionTag struct {
+	Type string `json:"type"`
+	Href string `json:"href"`
+	Name string `json:"name,omitempty"`
 }
 
 // attachment is an ActivityPub media attachment (image) on a Note. mediaType is
