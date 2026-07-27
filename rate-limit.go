@@ -100,6 +100,61 @@ func newRateLimiters() *rateLimiters {
 	return newRateLimitersWith(globalBudget, perClientBudget, rateWindow)
 }
 
+// taskQueue is the sliding-window log backing a limiter. It replaces the
+// library's default queue, whose CutOffBefore is a no-op when every task has
+// expired (start == len): Limit() has already subtracted those weights, so the
+// next call subtracts them again, the unsigned total underflows to ~4e9 and
+// IsLocked() latches. On a low-traffic gateway (idle gaps longer than the
+// window) that 429s peers far under budget — including Mastodon fetching our
+// actor document to verify a signature, which fails the whole delivery.
+type taskQueue struct {
+	mu    sync.Mutex
+	tasks []ratelimiter.Task
+}
+
+func (q *taskQueue) Len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.tasks)
+}
+
+func (q *taskQueue) TaskByIndex(i int) ratelimiter.Task {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(q.tasks) {
+		i = len(q.tasks) - 1
+	}
+	return q.tasks[i]
+}
+
+func (q *taskQueue) CutOffBefore(start int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if start <= 0 {
+		return
+	}
+	if start >= len(q.tasks) {
+		q.tasks = q.tasks[:0]
+		return
+	}
+	q.tasks = q.tasks[start:]
+}
+
+func (q *taskQueue) Append(tasks ...ratelimiter.Task) []ratelimiter.Task {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.tasks = append(q.tasks, tasks...)
+	return q.tasks
+}
+
+// newLimiter builds a limiter over the fixed taskQueue.
+func newLimiter(budget uint32, window time.Duration) *ratelimiter.Limiter {
+	return ratelimiter.NewLimiter(budget, window, &taskQueue{})
+}
+
 // newRateLimitersWith parameterizes the budgets/window so tests can exercise
 // the middleware without spending 120 requests per case.
 func newRateLimitersWith(global, perClient uint32, window time.Duration) *rateLimiters {
@@ -111,7 +166,7 @@ func newRateLimitersWith(global, perClient uint32, window time.Duration) *rateLi
 			func(_ string, l *ratelimiter.Limiter) { l.Close() },
 			clientLimiterTTL),
 	}
-	rl.global.Store(ratelimiter.NewLimiter(global, window, nil))
+	rl.global.Store(newLimiter(global, window))
 	return rl
 }
 
@@ -125,7 +180,7 @@ func (rl *rateLimiters) client(ip string) *ratelimiter.Limiter {
 		rl.clients.Add(ip, l)
 		return l
 	}
-	l := ratelimiter.NewLimiter(rl.clientBudget, rl.window, nil)
+	l := newLimiter(rl.clientBudget, rl.window)
 	rl.clients.Add(ip, l)
 	return l
 }
@@ -167,7 +222,7 @@ func (rl *rateLimiters) resetGlobalIfStuck(lockedSince, now time.Time) time.Time
 		return now
 	}
 	if now.Sub(lockedSince) >= rl.window {
-		rl.global.Store(ratelimiter.NewLimiter(rl.globalBudget, rl.window, nil))
+		rl.global.Store(newLimiter(rl.globalBudget, rl.window))
 		return time.Time{}
 	}
 	return lockedSince
@@ -191,7 +246,7 @@ func (rl *rateLimiters) resetStuckClients(lockedSince map[string]time.Time, now 
 		}
 		if now.Sub(since) >= rl.window {
 			rl.mu.Lock()
-			rl.clients.Add(ip, ratelimiter.NewLimiter(rl.clientBudget, rl.window, nil))
+			rl.clients.Add(ip, newLimiter(rl.clientBudget, rl.window))
 			rl.mu.Unlock()
 			delete(lockedSince, ip)
 		}
