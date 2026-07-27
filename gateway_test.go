@@ -339,6 +339,62 @@ func TestBridgeReplyEmbedsParentInNoteID(t *testing.T) {
 	}
 }
 
+// TestScanKeepsFederatingOnEmptyFollowerBlip guards the fix for federation
+// stopping on a transient read: a user-scoped follower read falls back to a
+// broadcast when the owner node is unreachable (a node restart), and a non-owner
+// node answers with an empty list. Stopping on that single empty read killed
+// federation, and posts made while stopped are seeded as already-published when
+// it resumes — they never reach the Fediverse.
+func TestScanKeepsFederatingOnEmptyFollowerBlip(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	usersJSON, _ := json.Marshal(usersResponse{Users: []user{{Id: "alice"}}})
+	withFollower, _ := json.Marshal(followersResponse{
+		Followers: []string{encodeActorID("https://mastodon.social/users/warpnet")},
+	})
+	empty, _ := json.Marshal(followersResponse{})
+
+	req := &scanRequester{users: usersJSON, followers: withFollower}
+	o := newOutboundFederation(ctx, req, testGateway(t))
+
+	o.scan("alice")
+	if !o.federating("alice") {
+		t.Fatal("a user with an ap: follower must be federated")
+	}
+
+	req.followers = empty // owner node unreachable — broadcast answers empty
+	o.scan("alice")
+	if !o.federating("alice") {
+		t.Fatal("stopped federating on a single empty read")
+	}
+
+	o.scan("alice") // still empty — a real unfollow
+	if o.federating("alice") {
+		t.Fatal("a repeated empty read must stop federation")
+	}
+}
+
+// scanRequester serves scan(): the user page and a swappable follower list.
+type scanRequester struct {
+	users     []byte
+	followers []byte
+}
+
+func (r *scanRequester) request(route string, _ any) ([]byte, error) {
+	switch route {
+	case routeGetUsers:
+		return r.users, nil
+	case routeGetFollowers:
+		return r.followers, nil
+	}
+	return []byte(`["accepted"]`), nil
+}
+
+func (r *scanRequester) requestUser(_, route string, payload any) ([]byte, error) {
+	return r.request(route, payload)
+}
+
 type fakeRequester struct {
 	lastRoute      string
 	lastPayload    any
