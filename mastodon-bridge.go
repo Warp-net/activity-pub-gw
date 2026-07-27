@@ -52,6 +52,7 @@ import (
 // implements it (reusing its SSRF-hardened client and signing keys).
 type apTransport interface {
 	apGetJSON(ctx context.Context, rawURL, accept string) (map[string]any, error)
+	resolveActorID(ctx context.Context, id string) (string, error)
 	apGetArray(ctx context.Context, rawURL, accept string) ([]any, error)
 	fetchActor(ctx context.Context, actorURL string) (map[string]any, error)
 	remoteInbox(ctx context.Context, actorURL string) (string, error)
@@ -78,8 +79,19 @@ func newMastodonBridge(ap apTransport, nodeID string) *mastodonBridge {
 // network already serves natively, and resolving them here would present a local
 // user as a foreign Mastodon account (a request looping back on itself).
 func (b *mastodonBridge) resolveHandle(ctx context.Context, handle string) (string, error) {
+	return b.ap.resolveActorID(ctx, handle)
+}
+
+// resolveActorID is the single place a bridged user id becomes an actor url. It
+// takes the "name@instance" handle every bridged id now uses, and still decodes
+// the legacy "ap:" form so follow graphs recorded before the switch keep
+// resolving. Handles hosted by the gateway itself are refused: they are Warpnet
+// users the network already serves natively, and resolving them here would
+// present a local user as a foreign Mastodon account (a request looping back on
+// itself).
+func (g *gateway) resolveActorID(ctx context.Context, handle string) (string, error) {
 	if actorURL, derr := decodeActorID(handle); derr == nil {
-		if u, perr := url.Parse(actorURL); perr == nil && b.ap.isSelfHost(u.Hostname()) {
+		if u, perr := url.Parse(actorURL); perr == nil && g.isSelfHost(u.Hostname()) {
 			return "", fmt.Errorf("mastodon: actor %s is served by this gateway: %w", actorURL, errSelfTarget)
 		}
 		return actorURL, nil
@@ -88,11 +100,16 @@ func (b *mastodonBridge) resolveHandle(ctx context.Context, handle string) (stri
 	if !ok || name == "" || instance == "" {
 		return "", fmt.Errorf("mastodon: %q is not a name@instance handle", handle)
 	}
-	if b.ap.isSelfHost(instance) {
+	if g.isSelfHost(instance) {
 		return "", fmt.Errorf("mastodon: %q is a Warpnet user served by this gateway: %w", handle, errSelfTarget)
 	}
+	if g.actorIDs != nil {
+		if cached, ok := g.actorIDs.Get(handle); ok {
+			return cached, nil
+		}
+	}
 	wf := "https://" + instance + "/.well-known/webfinger?resource=acct:" + name + "@" + instance
-	doc, err := b.ap.apGetJSON(ctx, wf, contentTypeJRD)
+	doc, err := g.apGetJSON(ctx, wf, contentTypeJRD)
 	if err != nil {
 		return "", fmt.Errorf("mastodon: webfinger %s: %w", handle, err)
 	}
@@ -102,6 +119,9 @@ func (b *mastodonBridge) resolveHandle(ctx context.Context, handle string) (stri
 			continue
 		}
 		if href, _ := link["href"].(string); href != "" {
+			if g.actorIDs != nil {
+				g.actorIDs.Add(handle, href)
+			}
 			return href, nil
 		}
 	}

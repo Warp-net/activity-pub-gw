@@ -81,7 +81,7 @@ func (o *outboundFederation) start(localUser string) {
 	o.started[localUser] = cancel
 	log.Infof("outbound: federating %s", localUser)
 	go newTweetPoller(o.req, localUser, o.g.publishNote).run(ctx)
-	go newFollowPoller(o.req, localUser,
+	go newFollowPoller(o.req, o.g, localUser,
 		func(actorURL string) { o.g.sendFollow(localUser, actorURL) },
 		func(actorURL string) { o.g.sendUndoFollow(localUser, actorURL) },
 	).run(ctx)
@@ -107,22 +107,25 @@ func (o *outboundFederation) stop(localUser string) {
 const followPollInterval = 30 * time.Second
 
 // followPoller federates the owner's *outbound* follows. It polls the owner's
-// followings; those that are Fediverse actors (ap:-encoded ids, i.e. accounts
-// the gateway ingested) get a signed Follow delivered to their inbox, and an
-// Undo(Follow) when the owner unfollows. The first poll only records a baseline
-// (history isn't replayed), matching the tweet poller.
+// followings; those that are Fediverse accounts get a signed Follow delivered to
+// their inbox, and an Undo(Follow) when the owner unfollows. The first poll only
+// records a baseline (history isn't replayed), matching the tweet poller.
 type followPoller struct {
 	req        nodeRequester
+	resolver   actorResolver
 	owner      string
 	onFollow   func(actorURL string)
 	onUnfollow func(actorURL string)
 	interval   time.Duration
-	known      map[string]bool // ap: actor URLs already federated; nil until first poll
+	known      map[string]bool // actor URLs already federated; nil until first poll
 }
 
-func newFollowPoller(req nodeRequester, owner string, onFollow, onUnfollow func(string)) *followPoller {
+func newFollowPoller(
+	req nodeRequester, resolver actorResolver, owner string, onFollow, onUnfollow func(string),
+) *followPoller {
 	return &followPoller{
 		req:        req,
+		resolver:   resolver,
 		owner:      owner,
 		onFollow:   onFollow,
 		onUnfollow: onUnfollow,
@@ -162,9 +165,17 @@ func (p *followPoller) poll() error {
 
 	current := make(map[string]bool)
 	for _, id := range resp.Followings {
-		if actorURL, derr := decodeActorID(id); derr == nil {
-			current[actorURL] = true
+		if !isBridgedUserID(id) {
+			continue // a Warpnet user, nothing to federate
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), resolveFollowerTimeout)
+		actorURL, rerr := p.resolver.resolveActorID(ctx, id)
+		cancel()
+		if rerr != nil {
+			log.Warnf("follow poll: resolving %s: %v", id, rerr)
+			continue
+		}
+		current[actorURL] = true
 	}
 
 	if p.known == nil { // baseline only — don't replay existing follows
@@ -267,7 +278,7 @@ func (o *outboundFederation) runScanner(scanUser string) {
 // the ap: follower graph. Users whose follower list could not be read are left
 // untouched (never stopped on a transient error).
 func (o *outboundFederation) scan(scanUser string) {
-	followers := nodeFollowerStore{req: o.req}
+	followers := nodeFollowerStore{req: o.req, resolver: o.g}
 	limit := federationScanPageSize
 	var cursor string
 	for range federationScanMaxPages {

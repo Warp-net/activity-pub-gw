@@ -431,10 +431,23 @@ func (f *fakeRequester) requestUser(_, route string, payload any) ([]byte, error
 	return f.request(route, payload)
 }
 
+// stubResolver stands in for the gateway's handle -> actor url lookup.
+type stubResolver struct{ byID map[string]string }
+
+func (r stubResolver) resolveActorID(_ context.Context, id string) (string, error) {
+	if url, ok := r.byID[id]; ok {
+		return url, nil
+	}
+	return decodeActorID(id) // legacy "ap:" ids need no lookup
+}
+
 func TestNodeFollowerStore(t *testing.T) {
 	const actor = "https://mastodon.social/users/bob"
+	const legacy = "https://mastodon.social/users/carol"
 	fr := &fakeRequester{}
-	s := nodeFollowerStore{req: fr}
+	s := nodeFollowerStore{req: fr, resolver: stubResolver{byID: map[string]string{
+		"bob@mastodon.social": actor,
+	}}}
 
 	if err := s.Add("owner1", actor); err != nil {
 		t.Fatal(err)
@@ -446,13 +459,17 @@ func TestNodeFollowerStore(t *testing.T) {
 	if ev.FollowingId != "owner1" {
 		t.Fatalf("following id = %q", ev.FollowingId)
 	}
-	if got, _ := decodeActorID(ev.FollowerId); got != actor {
-		t.Fatalf("follower id didn't round-trip: %q -> %q", ev.FollowerId, got)
+	// Warpnet stores the handle: the "ap:" encoding must not leak out of the
+	// gateway, so a follower renders as a profile there instead of a raw id.
+	if ev.FollowerId != "bob@mastodon.social" {
+		t.Fatalf("follower id = %q, want the bob@mastodon.social handle", ev.FollowerId)
 	}
 
-	// List decodes AP follower ids and skips native Warpnet ids.
+	// List resolves handles, still decodes follow graphs recorded as "ap:" before
+	// the switch, and skips native Warpnet ids.
 	resp := followersResponse{Followers: []string{
-		encodeActorID(actor),
+		"bob@mastodon.social",
+		encodeActorID(legacy),
 		"01KSGHBHKG0N77T6A3RZV8WSH5", // native ULID — must be skipped
 	}}
 	fr.followersJSON, _ = json.Marshal(resp)
@@ -461,7 +478,7 @@ func TestNodeFollowerStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(urls) != 1 || urls[0] != actor {
+	if len(urls) != 2 || urls[0] != actor || urls[1] != legacy {
 		t.Fatalf("list mismatch: %+v", urls)
 	}
 }
@@ -1094,12 +1111,14 @@ func TestSafeClientBlocksPrivateDial(t *testing.T) {
 func TestFollowPollerDiff(t *testing.T) {
 	fr := &fakeRequester{}
 	var followed, unfollowed []string
-	p := newFollowPoller(fr, "owner",
+	p := newFollowPoller(fr, stubResolver{byID: map[string]string{
+		"bob@mastodon.social": "https://mastodon.social/users/bob",
+	}}, "owner",
 		func(a string) { followed = append(followed, a) },
 		func(a string) { unfollowed = append(unfollowed, a) },
 	)
 	enc := func(urls ...string) []byte {
-		ids := []string{"warpnet-native-id"} // non-ap following must be ignored
+		ids := []string{"01KSGHBHKG0N77T6A3RZV8WSH5"} // a Warpnet following must be ignored
 		for _, u := range urls {
 			ids = append(ids, encodeActorID(u))
 		}

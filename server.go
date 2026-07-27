@@ -119,6 +119,11 @@ type gateway struct {
 	// collapses onto one round-trip. Transient, in memory, 1s TTL — not storage.
 	getCache *expirable.LRU[string, cachedGet]
 
+	// actorIDs caches handle -> actor url so resolving the follow graph (a
+	// followers page, a note fan-out) doesn't WebFinger every follower on every
+	// call. Transient, in memory — the graph itself lives in Warpnet.
+	actorIDs *expirable.LRU[string, string]
+
 	// sf collapses concurrent identical signed GETs onto a single upstream
 	// round-trip. getCache only dedupes sequential bursts (it fills after a
 	// request returns), so the overlapping author/stats/context fetches a reply
@@ -146,6 +151,11 @@ const (
 	// single request burst, never serves stale data across user actions.
 	getCacheTTL  = time.Second
 	getCacheSize = 2048
+
+	// A handle's actor url effectively never changes, so this may be long; it is
+	// bounded and in memory only.
+	actorIDsTTL  = time.Hour
+	actorIDsSize = 2048
 )
 
 func (g *gateway) baseURL() string            { return "https://" + g.host }
@@ -488,11 +498,18 @@ func (g *gateway) serveFollowing(w http.ResponseWriter, user string) {
 	}
 	items := make([]any, 0, len(resp.Followings))
 	for _, fid := range resp.Followings {
-		if url, derr := decodeActorID(fid); derr == nil {
-			items = append(items, url)
-		} else {
-			items = append(items, g.actorID(fid))
+		if !isBridgedUserID(fid) {
+			items = append(items, g.actorID(fid)) // a Warpnet user we serve ourselves
+			continue
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), resolveFollowerTimeout)
+		actorURL, rerr := g.resolveActorID(ctx, fid)
+		cancel()
+		if rerr != nil {
+			log.Warnf("following: resolving %s: %v", fid, rerr)
+			continue
+		}
+		items = append(items, actorURL)
 	}
 	writeJSON(w, contentTypeAP, orderedCollection{
 		Context:      asContext,
