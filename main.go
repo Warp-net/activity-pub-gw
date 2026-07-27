@@ -64,7 +64,7 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const gatewayVersion = "0.1.81"
+const gatewayVersion = "0.1.82"
 
 // logRingSize is how many recent log lines the /logs endpoint retains in memory.
 const logRingSize = 2000
@@ -134,7 +134,6 @@ func main() {
 	var followers followerStore
 	var req nodeRequester
 	if nodeCli != nil {
-		followers = nodeFollowerStore{req: nodeCli}
 		req = nodeCli
 	} else {
 		followers = newMemFollowerStore()
@@ -153,8 +152,14 @@ func main() {
 		// times with exponential backoff; bounded so it stays within the request budget.
 		retrier:   retrier.New(300*time.Millisecond, 3, retrier.ExponentialBackoff),
 		getCache:  expirable.NewLRU[string, cachedGet](getCacheSize, nil, getCacheTTL),
+		actorIDs:  expirable.NewLRU[string, string](actorIDsSize, nil, actorIDsTTL),
 		logs:      logs,
 		logsToken: os.Getenv("GATEWAY_LOGS_TOKEN"),
+	}
+	if nodeCli != nil {
+		// The store resolves stored follower handles back to actor urls through the
+		// gateway, so it is wired once g exists.
+		g.followers = nodeFollowerStore{req: nodeCli, resolver: g}
 	}
 
 	// Serve Warpnet's public /public routes over libp2p (Mastodon -> Warpnet):

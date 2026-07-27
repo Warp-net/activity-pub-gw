@@ -152,7 +152,7 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 				return "", nil, false
 			}
 			return routePostUnfollow, newFollowEvent{
-				FollowerId: encodeActorID(actor), FollowingId: owner,
+				FollowerId: bridgedUserID(actor), FollowingId: owner,
 			}, true
 		case typeLike:
 			owner, tweetID, ok := g.parseLocalStatus(stringField(obj, keyObject))

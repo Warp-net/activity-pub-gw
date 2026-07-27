@@ -28,8 +28,12 @@ resulting from the use or misuse of this software.
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // nodeRequester is the subset of nodeClient that the follower store needs.
@@ -47,12 +51,24 @@ type nodeRequester interface {
 // actor URLs travel as base64url follower ids (see encodeActorID), so the
 // gateway itself stores no follower state.
 type nodeFollowerStore struct {
-	req nodeRequester
+	req      nodeRequester
+	resolver actorResolver
+}
+
+// actorResolver turns a stored follower id into the actor url the gateway
+// delivers to. Warpnet only ever sees the "name@instance" handle; the encoding
+// of older "ap:" ids stays an implementation detail behind this.
+type actorResolver interface {
+	resolveActorID(ctx context.Context, id string) (string, error)
 }
 
 const (
 	followersPageSize = uint64(100)
 	followersMaxPages = 100
+
+	// resolveFollowerTimeout bounds the WebFinger lookup a handle needs; the
+	// result is cached, so this is paid once per follower per cache window.
+	resolveFollowerTimeout = 10 * time.Second
 )
 
 // nodeResponseError reports a node handler failure: warpnet streams
@@ -74,7 +90,7 @@ func nodeResponseError(bt []byte) error {
 
 func (s nodeFollowerStore) Add(localUser, actorURL string) error {
 	bt, err := s.req.requestUser(localUser, routePostFollow, newFollowEvent{
-		FollowerId:  encodeActorID(actorURL),
+		FollowerId:  bridgedUserID(actorURL),
 		FollowingId: localUser,
 	})
 	if err != nil {
@@ -104,9 +120,15 @@ func (s nodeFollowerStore) List(localUser string) ([]string, error) {
 			return nil, err
 		}
 		for _, id := range resp.Followers {
-			actorURL, derr := decodeActorID(id)
-			if derr != nil {
-				continue // native Warpnet follower id, not an AP actor — skip
+			if !isBridgedUserID(id) {
+				continue // native Warpnet follower, not a Fediverse actor
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), resolveFollowerTimeout)
+			actorURL, rerr := s.resolver.resolveActorID(ctx, id)
+			cancel()
+			if rerr != nil {
+				log.Warnf("followers: resolving %s: %v", id, rerr)
+				continue
 			}
 			urls = append(urls, actorURL)
 		}
