@@ -623,6 +623,39 @@ func TestRateLimitClientRecovers(t *testing.T) {
 	}
 }
 
+// TestRateLimitIdleClientStaysUnlocked guards the queue fix: with idle gaps
+// longer than the window, every queued task expires on each call, and the
+// library's default queue then fails to drop them (CutOffBefore no-ops when
+// start == len). Limit() re-subtracts the same weights on the next call, the
+// unsigned total underflows to ~4e9 and IsLocked() latches — 429ing a client
+// that spent 5 of its 1000 units. That is what broke follow/reply delivery:
+// Mastodon got a 429 fetching our actor document and could not verify the
+// signature ("Unable to fetch key JSON").
+func TestRateLimitIdleClientStaysUnlocked(t *testing.T) {
+	window := 20 * time.Millisecond
+	rl := newRateLimitersWith(1000, 1000, window) // both budgets roomy
+	h := rl.middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	do := func() int {
+		r := httptest.NewRequest(http.MethodGet, "/users/alice", nil) // weight 2
+		r.RemoteAddr = "203.0.113.11:1000"
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	for i := 0; i < 6; i++ {
+		if code := do(); code != http.StatusOK {
+			t.Fatalf("request %d after idle gaps: status = %d, want 200", i+1, code)
+		}
+		time.Sleep(window * 2) // let the whole window expire between requests
+	}
+	if l := rl.client("203.0.113.11"); l.IsLocked() {
+		t.Fatal("client limiter locked while far under budget")
+	}
+}
+
 func TestRequestWeight(t *testing.T) {
 	cases := map[string]uint32{
 		"/nodeinfo/2.0":              weightStatic,
