@@ -63,6 +63,14 @@ func encodeActorID(actorURL string) string {
 	return apFollowerPrefix + base64.RawURLEncoding.EncodeToString([]byte(actorURL))
 }
 
+// isBridgedUserID reports whether a Warpnet user id denotes a Fediverse account
+// rather than a Warpnet member: either a gateway-minted "ap:" id (follow graph)
+// or a "name@instance" handle (activity attribution, see bridgedUserID).
+// Warpnet's own ids are ULIDs, so neither form collides with them.
+func isBridgedUserID(id string) bool {
+	return strings.HasPrefix(id, apFollowerPrefix) || strings.Contains(id, "@")
+}
+
 func decodeActorID(id string) (string, error) {
 	enc, ok := strings.CutPrefix(id, apFollowerPrefix)
 	if !ok {

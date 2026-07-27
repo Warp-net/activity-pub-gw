@@ -749,8 +749,11 @@ func TestTranslateInbound(t *testing.T) {
 	if like.TweetId != "t1" || like.UserId != "alice" {
 		t.Fatalf("like event: %+v", like)
 	}
-	if got, _ := decodeActorID(like.OwnerId); got != actor {
-		t.Fatalf("liker id round-trip: %q", like.OwnerId)
+	// A Fediverse actor is attributed by its "name@instance" handle — the id its
+	// bridged profile resolves under. An "ap:<base64url>" id here has no profile
+	// to open, so the client renders the raw id.
+	if like.OwnerId != "bob@m" {
+		t.Fatalf("liker id = %q, want the bob@m handle", like.OwnerId)
 	}
 
 	route, payload, ok = g.translateInbound(map[string]any{
@@ -769,6 +772,11 @@ func TestTranslateInbound(t *testing.T) {
 	}
 	if reply.Username != "bob@m" {
 		t.Fatalf("reply username = %q, want bob@m", reply.Username)
+	}
+	// The reply's author id must be the handle too, not the ActivityPub id: the
+	// thread showed "@ap:aHR0cHM6..." next to the name because they disagreed.
+	if reply.UserId != "bob@m" {
+		t.Fatalf("reply user_id = %q, want the bob@m handle", reply.UserId)
 	}
 
 	// Quote-post convention: no inReplyTo, text opens with "RE: <status URL>".
@@ -811,8 +819,8 @@ func TestTranslateInbound(t *testing.T) {
 	if q.Text != "hot take" || q.RetweetedBy == nil || q.UserId != *q.RetweetedBy {
 		t.Fatalf("quote comment/author: %+v", q)
 	}
-	if got, _ := decodeActorID(*q.RetweetedBy); got != actor {
-		t.Fatalf("quoter id round-trip: %q", *q.RetweetedBy)
+	if *q.RetweetedBy != "bob@m" {
+		t.Fatalf("quoter id = %q, want the bob@m handle", *q.RetweetedBy)
 	}
 
 	// Quote property with a leading "RE:" fallback (Mastodon wire form)
@@ -885,8 +893,8 @@ func TestTranslateInbound(t *testing.T) {
 	if rt.Id != "t1" || rt.RetweetedBy == nil {
 		t.Fatalf("retweet event: %+v", rt)
 	}
-	if got, _ := decodeActorID(*rt.RetweetedBy); got != actor {
-		t.Fatalf("booster id round-trip: %q", *rt.RetweetedBy)
+	if *rt.RetweetedBy != "bob@m" {
+		t.Fatalf("booster id = %q, want the bob@m handle", *rt.RetweetedBy)
 	}
 
 	// Foreign-host objects and unhandled types are rejected.
