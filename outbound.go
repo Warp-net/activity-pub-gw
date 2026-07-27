@@ -45,10 +45,25 @@ type outboundFederation struct {
 	g       *gateway
 	mu      sync.Mutex
 	started map[string]context.CancelFunc
+	// emptyScans counts consecutive scans that read no ap: follower for a user.
+	// Owned by the scan goroutine alone.
+	emptyScans map[string]int
 }
 
 func newOutboundFederation(ctx context.Context, req nodeRequester, g *gateway) *outboundFederation {
-	return &outboundFederation{ctx: ctx, req: req, g: g, started: map[string]context.CancelFunc{}}
+	return &outboundFederation{
+		ctx: ctx, req: req, g: g,
+		started:    map[string]context.CancelFunc{},
+		emptyScans: map[string]int{},
+	}
+}
+
+// federating reports whether localUser's posts are currently being federated.
+func (o *outboundFederation) federating(localUser string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	_, ok := o.started[localUser]
+	return ok
 }
 
 // start begins federating localUser's posts and outbound follows; idempotent per
@@ -226,6 +241,10 @@ const (
 	federationScanInterval = 5 * time.Minute
 	federationScanPageSize = uint64(100)
 	federationScanMaxPages = 100
+
+	// emptyScansToStop is how many consecutive scans must read no ap: follower
+	// for a user before federation stops (see scan).
+	emptyScansToStop = 2
 )
 
 // runScanner derives the federated set from the follow graph stored in Warpnet
@@ -275,8 +294,19 @@ func (o *outboundFederation) scan(scanUser string) {
 				continue
 			}
 			if len(urls) > 0 {
+				delete(o.emptyScans, u.Id)
 				o.start(u.Id)
-			} else {
+				continue
+			}
+			// An empty read is not authoritative: a user-scoped route falls back
+			// to a broadcast when the owner node is unreachable, and a non-owner
+			// node answers with an empty follower list. Stopping on that kills
+			// federation every time the owner node blips (a restart), and posts
+			// made while stopped are seeded as already-published when it
+			// resumes — silently never federated. A real unfollow keeps reading
+			// empty, so require it twice.
+			o.emptyScans[u.Id]++
+			if o.emptyScans[u.Id] >= emptyScansToStop {
 				o.stop(u.Id)
 			}
 		}

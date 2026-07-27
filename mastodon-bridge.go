@@ -871,6 +871,20 @@ func (b *mastodonBridge) Follow(ctx context.Context, localUser, followingHandle 
 	return nil
 }
 
+// mentionOf builds the Mention tag for the replied-to author. href is what
+// Mastodon resolves the mention by; name is the @handle it renders, derived
+// from the parent status url.
+func mentionOf(authorActorURL, parentURL string) []mentionTag {
+	if authorActorURL == "" {
+		return nil
+	}
+	m := mentionTag{Type: typeMention, Href: authorActorURL}
+	if handle := statusAuthorHandle(parentURL); handle != "" {
+		m.Name = "@" + handle
+	}
+	return []mentionTag{m}
+}
+
 // Reply federates a Warpnet reply as a Create(Note) inReplyTo the parent.
 func (b *mastodonBridge) Reply(ctx context.Context, ev newReplyEvent) error {
 	parentURL := string(ev.RootId)
@@ -908,6 +922,7 @@ func (b *mastodonBridge) Reply(ctx context.Context, ev newReplyEvent) error {
 		InReplyTo:    parentURL,
 		To:           []string{author},
 		Cc:           []string{asPublic},
+		Tag:          mentionOf(author, parentURL),
 	}
 	create := activity{Context: asContext, ID: noteURL + "#create", Type: typeCreate, Actor: actorID, Object: n, To: []string{author}, Cc: []string{asPublic}}
 	return b.ap.postSigned(ctx, localUser, inbox, create)
