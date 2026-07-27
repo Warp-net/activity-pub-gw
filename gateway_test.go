@@ -741,12 +741,16 @@ func TestTranslateInbound(t *testing.T) {
 	if !ok || route != routePostLike {
 		t.Fatalf("like: route=%q ok=%v", route, ok)
 	}
+	// owner_id is the liker and user_id the liked tweet's author — the direction
+	// the node's like handler and the client use. With them swapped the node
+	// books the like as the author liking their own tweet, so the author gets no
+	// notification and the like is streamed back to the gateway.
 	like := payload.(likeEvent)
-	if like.TweetId != "t1" || like.OwnerId != "alice" {
+	if like.TweetId != "t1" || like.UserId != "alice" {
 		t.Fatalf("like event: %+v", like)
 	}
-	if got, _ := decodeActorID(like.UserId); got != actor {
-		t.Fatalf("liker id round-trip: %q", like.UserId)
+	if got, _ := decodeActorID(like.OwnerId); got != actor {
+		t.Fatalf("liker id round-trip: %q", like.OwnerId)
 	}
 
 	route, payload, ok = g.translateInbound(map[string]any{

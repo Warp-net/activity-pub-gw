@@ -57,8 +57,12 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 		if !ok {
 			return "", nil, false
 		}
+		// OwnerId is the liker, UserId the liked tweet's author (the direction
+		// the node's like handler and the client both use). Swapping them books
+		// the like as the author liking their own tweet: no notification, and
+		// the node forwards the like straight back to us.
 		return routePostLike, likeEvent{
-			TweetId: tweetID, UserId: encodeActorID(actor), OwnerId: owner,
+			TweetId: tweetID, UserId: owner, OwnerId: encodeActorID(actor),
 		}, true
 
 	case typeAnnounce:
@@ -156,7 +160,7 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 				return "", nil, false
 			}
 			return routePostUnlike, likeEvent{
-				TweetId: tweetID, UserId: encodeActorID(actor), OwnerId: owner,
+				TweetId: tweetID, UserId: owner, OwnerId: encodeActorID(actor),
 			}, true
 		case typeAnnounce:
 			_, tweetID, ok := g.parseLocalStatus(stringField(obj, keyObject))
