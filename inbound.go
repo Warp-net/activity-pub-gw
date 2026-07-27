@@ -62,7 +62,7 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 		// the like as the author liking their own tweet: no notification, and
 		// the node forwards the like straight back to us.
 		return routePostLike, likeEvent{
-			TweetId: tweetID, UserId: owner, OwnerId: encodeActorID(actor),
+			TweetId: tweetID, UserId: owner, OwnerId: bridgedUserID(actor),
 		}, true
 
 	case typeAnnounce:
@@ -70,7 +70,7 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 		if !ok {
 			return "", nil, false
 		}
-		by := encodeActorID(actor)
+		by := bridgedUserID(actor)
 		return routePostRetweet, tweet{
 			Id:          tweetID,
 			RootId:      tweetID,
@@ -99,7 +99,7 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 				if stripped, ok := stripQuoteFallback(text); ok && stripped != "" {
 					text = stripped
 				}
-				by := encodeActorID(actor)
+				by := bridgedUserID(actor)
 				return routePostRetweet, tweet{
 					Id:            tweetID,
 					CreatedAt:     time.Now(),
@@ -136,7 +136,7 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 			ParentUserId: owner,
 			RootId:       parentID,
 			Text:         text,
-			UserId:       encodeActorID(actor),
+			UserId:       bridgedUserID(actor),
 			Username:     handleFromActorURL(actor),
 		}, true
 
@@ -160,7 +160,7 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 				return "", nil, false
 			}
 			return routePostUnlike, likeEvent{
-				TweetId: tweetID, UserId: owner, OwnerId: encodeActorID(actor),
+				TweetId: tweetID, UserId: owner, OwnerId: bridgedUserID(actor),
 			}, true
 		case typeAnnounce:
 			_, tweetID, ok := g.parseLocalStatus(stringField(obj, keyObject))
@@ -168,7 +168,7 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 				return "", nil, false
 			}
 			return routePostUnretweet, unretweetEvent{
-				TweetId: tweetID, RetweeterId: encodeActorID(actor),
+				TweetId: tweetID, RetweeterId: bridgedUserID(actor),
 			}, true
 		}
 	}
@@ -197,9 +197,23 @@ func (g *gateway) parseLocalStatus(statusURL string) (owner, tweetID string, ok 
 	return owner, tweetID, true
 }
 
+// bridgedUserID is the Warpnet user id for a Fediverse actor whose activity we
+// hand to a node: the "name@instance" handle, which is exactly the id the
+// bridged profile resolves under, so a liker, booster or reply author opens as a
+// profile instead of showing a raw "ap:<base64url>" id. The encoded actor url is
+// the fallback for an actor url no handle can be derived from. (The follow graph
+// keeps using encodeActorID: the gateway decodes those ids back to inboxes.)
+func bridgedUserID(actorURL string) string {
+	handle := handleFromActorURL(actorURL)
+	if !strings.Contains(handle, "@") {
+		return encodeActorID(actorURL)
+	}
+	return handle
+}
+
 // handleFromActorURL turns a remote actor URL (https://host/users/bob or
-// https://host/@bob) into a readable "bob@host" handle for display, falling
-// back to the raw URL when it can't be parsed.
+// https://host/@bob) into a readable "bob@host" handle, falling back to the raw
+// URL when it can't be parsed.
 func handleFromActorURL(actorURL string) string {
 	u, err := url.Parse(actorURL)
 	if err != nil || u.Host == "" {

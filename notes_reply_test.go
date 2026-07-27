@@ -117,7 +117,14 @@ func TestServeRepliesUsesTweetsAPI(t *testing.T) {
 		Id: "01REPLY20000000000000000000", ParentId: &parent, RootId: parent,
 		UserId: apFollowerPrefix + "xxx", Username: "bob@m", Text: "foreign reply", CreatedAt: time.Unix(0, 0),
 	}
-	bt, _ := json.Marshal(tweetsResponse{Tweets: []tweet{native, foreign}})
+	// A reply the gateway itself ingested is attributed by handle (see
+	// bridgedUserID), so the skip must catch that form too or Mastodon gets its
+	// own replies back as duplicates.
+	foreignByHandle := tweet{
+		Id: "01REPLY30000000000000000000", ParentId: &parent, RootId: parent,
+		UserId: "bob@m", Username: "bob@m", Text: "foreign reply by handle", CreatedAt: time.Unix(0, 0),
+	}
+	bt, _ := json.Marshal(tweetsResponse{Tweets: []tweet{native, foreign, foreignByHandle}})
 	fr := &fakeRequester{tweetsJSON: bt}
 	g.req = fr
 

@@ -528,7 +528,7 @@ func (g *gateway) serveReplies(w http.ResponseWriter, user, tweetID string) {
 	parentURL := g.actorID(user) + pathStatuses + tweetID
 	items := make([]any, 0, len(resp.Tweets))
 	for _, t := range resp.Tweets {
-		if t.Id == "" || strings.HasPrefix(t.UserId, apFollowerPrefix) {
+		if t.Id == "" || isBridgedUserID(t.UserId) {
 			continue // skip fediverse-authored replies; Mastodon already has them
 		}
 		n := g.buildNote(t.UserId, t)
