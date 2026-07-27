@@ -94,6 +94,7 @@ var (
 	errInsecureURL      = errors.New("remote URL must be https")
 	errBlockedHost      = errors.New("remote URL host is not allowed")
 	errTooManyRedirects = errors.New("too many redirects")
+	errSelfTarget       = errors.New("remote URL targets this gateway")
 )
 
 // gateway is the ActivityPub front for one bridged Warpnet user. Documents are
@@ -598,6 +599,32 @@ func validateRemoteURL(raw string) error {
 	return nil
 }
 
+// isSelfHost reports whether host is this gateway's own public hostname.
+func (g *gateway) isSelfHost(host string) bool {
+	return g.host != "" && strings.EqualFold(host, g.host)
+}
+
+// isSelfURL reports whether raw points back at this gateway.
+func (g *gateway) isSelfURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && g.isSelfHost(u.Hostname())
+}
+
+// checkRemoteURL guards every outbound federation fetch/delivery. Besides the
+// SSRF checks it refuses URLs pointing back at this gateway: our own users are
+// served from Warpnet, so dereferencing ourselves over ActivityPub would loop a
+// local user back in as a foreign Mastodon account (and let a peer bounce our
+// own activities back into Warpnet through the inbox).
+func (g *gateway) checkRemoteURL(raw string) error {
+	if g.isSelfURL(raw) {
+		return fmt.Errorf("url %q: %w", raw, errSelfTarget)
+	}
+	if g.allowPrivateTargets {
+		return nil
+	}
+	return validateRemoteURL(raw)
+}
+
 // isBlockedIP reports whether ip is in a range outbound federation must never
 // reach (loopback, private, link-local, multicast, unspecified).
 func isBlockedIP(ip netip.Addr) bool {
@@ -732,10 +759,8 @@ func (g *gateway) signedGet(ctx context.Context, rawURL, accept string) (int, []
 }
 
 func (g *gateway) fetchActor(ctx context.Context, actorURL string) (map[string]any, error) {
-	if !g.allowPrivateTargets {
-		if err := validateRemoteURL(actorURL); err != nil {
-			return nil, err
-		}
+	if err := g.checkRemoteURL(actorURL); err != nil {
+		return nil, err
 	}
 	// G704: dereferencing remote actor URLs is intrinsic to ActivityPub
 	// federation; validateRemoteURL enforces https, full SSRF hardening is a
@@ -800,10 +825,8 @@ func (g *gateway) remoteInbox(ctx context.Context, actorURL string) (string, err
 // SSRF guard. Actor documents go through fetchActor (it signs for
 // authorized-fetch instances); this is for WebFinger and AP collections.
 func (g *gateway) apGetJSON(ctx context.Context, rawURL, accept string) (map[string]any, error) {
-	if !g.allowPrivateTargets {
-		if err := validateRemoteURL(rawURL); err != nil {
-			return nil, err
-		}
+	if err := g.checkRemoteURL(rawURL); err != nil {
+		return nil, err
 	}
 	status, bt, err := g.signedGet(ctx, rawURL, accept)
 	if err != nil {
@@ -822,10 +845,8 @@ func (g *gateway) apGetJSON(ctx context.Context, rawURL, accept string) (map[str
 // apGetArray is apGetJSON for endpoints that return a top-level JSON array (the
 // Mastodon REST list endpoints, e.g. an account's statuses).
 func (g *gateway) apGetArray(ctx context.Context, rawURL, accept string) ([]any, error) {
-	if !g.allowPrivateTargets {
-		if err := validateRemoteURL(rawURL); err != nil {
-			return nil, err
-		}
+	if err := g.checkRemoteURL(rawURL); err != nil {
+		return nil, err
 	}
 	status, bt, err := g.signedGet(ctx, rawURL, accept)
 	if err != nil {
@@ -844,10 +865,8 @@ func (g *gateway) apGetArray(ctx context.Context, rawURL, accept string) ([]any,
 // fetchMedia downloads a remote media URL (SSRF-guarded), returning its
 // content type and bytes.
 func (g *gateway) fetchMedia(ctx context.Context, rawURL string) (string, []byte, error) {
-	if !g.allowPrivateTargets {
-		if err := validateRemoteURL(rawURL); err != nil {
-			return "", nil, err
-		}
+	if err := g.checkRemoteURL(rawURL); err != nil {
+		return "", nil, err
 	}
 	start := time.Now()
 	status, bt, header, err := g.sendRetry(ctx, func() (*http.Request, error) {
@@ -869,10 +888,8 @@ func (g *gateway) fetchMedia(ctx context.Context, rawURL string) (string, []byte
 
 // postSigned delivers a signed POST of doc to target, as localUser.
 func (g *gateway) postSigned(ctx context.Context, localUser, target string, doc any) error {
-	if !g.allowPrivateTargets {
-		if err := validateRemoteURL(target); err != nil {
-			return err
-		}
+	if err := g.checkRemoteURL(target); err != nil {
+		return err
 	}
 	body, err := json.Marshal(doc)
 	if err != nil {
