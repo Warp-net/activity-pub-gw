@@ -59,6 +59,7 @@ type apTransport interface {
 	postSigned(ctx context.Context, localUser, target string, doc any) error
 	deliverFollow(localUser, remoteActorURL string, undo bool)
 	fetchMedia(ctx context.Context, rawURL string) (mimeType string, data []byte, err error)
+	isSelfHost(host string) bool
 }
 
 type mastodonBridge struct {
@@ -73,13 +74,22 @@ func newMastodonBridge(ap apTransport, nodeID string) *mastodonBridge {
 // resolveHandle resolves "name@instance" to its actor URL via WebFinger. An
 // "ap:" id (a remote actor Warpnet learned about through the follow graph)
 // already carries its actor URL, so it is decoded instead of WebFingered.
+// Handles hosted by the gateway itself are refused: they are Warpnet users the
+// network already serves natively, and resolving them here would present a local
+// user as a foreign Mastodon account (a request looping back on itself).
 func (b *mastodonBridge) resolveHandle(ctx context.Context, handle string) (string, error) {
 	if actorURL, derr := decodeActorID(handle); derr == nil {
+		if u, perr := url.Parse(actorURL); perr == nil && b.ap.isSelfHost(u.Hostname()) {
+			return "", fmt.Errorf("mastodon: actor %s is served by this gateway: %w", actorURL, errSelfTarget)
+		}
 		return actorURL, nil
 	}
 	name, instance, ok := strings.Cut(strings.TrimPrefix(handle, "@"), "@")
 	if !ok || name == "" || instance == "" {
 		return "", fmt.Errorf("mastodon: %q is not a name@instance handle", handle)
+	}
+	if b.ap.isSelfHost(instance) {
+		return "", fmt.Errorf("mastodon: %q is a Warpnet user served by this gateway: %w", handle, errSelfTarget)
 	}
 	wf := "https://" + instance + "/.well-known/webfinger?resource=acct:" + name + "@" + instance
 	doc, err := b.ap.apGetJSON(ctx, wf, contentTypeJRD)
@@ -777,14 +787,29 @@ func (b *mastodonBridge) followList(ctx context.Context, handle string, cursor *
 		if first := asString(page["first"]); first != "" && !hasItems {
 			pageURL = first
 		} else {
-			return collectHandles(page), asString(page["next"]), nil
+			return b.dropSelfHandles(collectHandles(page)), asString(page["next"]), nil
 		}
 	}
 	page, err := b.ap.apGetJSON(ctx, pageURL, contentTypeAP)
 	if err != nil {
 		return []string{}, "", nil //nolint:nilerr // hidden collection -> empty, not an error
 	}
-	return collectHandles(page), asString(page["next"]), nil
+	return b.dropSelfHandles(collectHandles(page)), asString(page["next"]), nil
+}
+
+// dropSelfHandles removes handles hosted by the gateway. A Warpnet user who
+// follows a Fediverse account appears in that account's follower list as our own
+// actor URL, so listing it would offer the user a Mastodon profile of themselves
+// — the loop back into Warpnet through the Fediverse.
+func (b *mastodonBridge) dropSelfHandles(handles []string) []string {
+	out := make([]string, 0, len(handles))
+	for _, h := range handles {
+		if _, instance, ok := strings.Cut(h, "@"); ok && b.ap.isSelfHost(instance) {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
 }
 
 func (b *mastodonBridge) GetImage(ctx context.Context, rawURL string) (getImageResponse, error) {

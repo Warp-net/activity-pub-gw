@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1751,4 +1752,84 @@ func TestGetUserResolvesAPFollowerID(t *testing.T) {
 	if u.Id != id {
 		t.Errorf("Id = %q, want the requested id %q", u.Id, id)
 	}
+}
+
+// The gateway must never resolve itself through the Fediverse: our own users are
+// served natively by Warpnet, so looping a request out to Mastodon and back here
+// would return a local user as a foreign Mastodon account.
+func TestSelfLoopRefused(t *testing.T) {
+	g := testGateway(t) // host gw.example
+	b := newMastodonBridge(g, "node1")
+	ctx := context.Background()
+
+	t.Run("own handle is not resolvable", func(t *testing.T) {
+		if _, err := b.GetUser(ctx, "alice@gw.example"); !errors.Is(err, errSelfTarget) {
+			t.Errorf("GetUser: err = %v, want errSelfTarget", err)
+		}
+		if _, err := b.GetTweets(ctx, "alice@gw.example", nil); !errors.Is(err, errSelfTarget) {
+			t.Errorf("GetTweets: err = %v, want errSelfTarget", err)
+		}
+		if _, err := b.GetFollowers(ctx, "alice@GW.EXAMPLE", nil); !errors.Is(err, errSelfTarget) {
+			t.Errorf("GetFollowers: err = %v, want errSelfTarget", err)
+		}
+		if err := b.Follow(ctx, "alice", "alice@gw.example", false); !errors.Is(err, errSelfTarget) {
+			t.Errorf("Follow: err = %v, want errSelfTarget", err)
+		}
+		if _, err := b.GetUser(ctx, encodeActorID(g.actorID("alice"))); !errors.Is(err, errSelfTarget) {
+			t.Errorf("GetUser(ap: self): err = %v, want errSelfTarget", err)
+		}
+	})
+
+	t.Run("own urls are neither fetched nor delivered to", func(t *testing.T) {
+		if _, err := g.fetchActor(ctx, g.actorID("alice")); !errors.Is(err, errSelfTarget) {
+			t.Errorf("fetchActor: err = %v, want errSelfTarget", err)
+		}
+		if _, err := g.apGetJSON(ctx, g.baseURL()+"/.well-known/webfinger", contentTypeJRD); !errors.Is(err, errSelfTarget) {
+			t.Errorf("apGetJSON: err = %v, want errSelfTarget", err)
+		}
+		if _, _, err := g.fetchMedia(ctx, g.baseURL()+pathMedia+"x"); !errors.Is(err, errSelfTarget) {
+			t.Errorf("fetchMedia: err = %v, want errSelfTarget", err)
+		}
+		if err := g.postSigned(ctx, "alice", g.baseURL()+pathInbox, activity{}); !errors.Is(err, errSelfTarget) {
+			t.Errorf("postSigned: err = %v, want errSelfTarget", err)
+		}
+		// A status of ours is not a Mastodon note either (Like/Reply/Delete).
+		if _, err := b.Like(ctx, "alice", g.actorID("alice")+pathStatuses+"1", false); !errors.Is(err, errSelfTarget) {
+			t.Errorf("Like: err = %v, want errSelfTarget", err)
+		}
+	})
+
+	// A Warpnet user who follows a Fediverse account shows up in that account's
+	// follower list as our own actor URL; it must not be offered as a profile.
+	t.Run("own actor is dropped from a remote follower list", func(t *testing.T) {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/.well-known/webfinger":
+				writeJSON(w, contentTypeJRD, map[string]any{
+					"links": []any{map[string]any{"rel": "self", "href": "https://" + r.Host + "/users/bob"}},
+				})
+			case "/users/bob":
+				writeJSON(w, contentTypeAP, map[string]any{
+					"id": "https://" + r.Host + "/users/bob", "followers": "https://" + r.Host + "/users/bob/followers",
+				})
+			case "/users/bob/followers":
+				writeJSON(w, contentTypeAP, map[string]any{
+					"orderedItems": []any{g.actorID("alice"), "https://other.example/users/carol"},
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+		g.client = srv.Client()
+		defer func() { g.client = http.DefaultClient }()
+
+		resp, err := b.GetFollowers(ctx, "bob@"+strings.TrimPrefix(srv.URL, "https://"), nil)
+		if err != nil {
+			t.Fatalf("GetFollowers: %v", err)
+		}
+		if len(resp.Followers) != 1 || resp.Followers[0] != "carol@other.example" {
+			t.Errorf("Followers = %v, want only the remote follower", resp.Followers)
+		}
+	})
 }
