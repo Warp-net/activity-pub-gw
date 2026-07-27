@@ -131,7 +131,7 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 		// reply notification.
 		return routePostTweet, newReplyEvent{
 			CreatedAt:    time.Now(),
-			Id:           randomToken(),
+			Id:           ingestedNoteID(obj),
 			ParentId:     &pid,
 			ParentUserId: owner,
 			RootId:       parentID,
@@ -195,6 +195,23 @@ func (g *gateway) parseLocalStatus(statusURL string) (owner, tweetID string, ok 
 		tweetID = tweetID[:i]
 	}
 	return owner, tweetID, true
+}
+
+// ingestedNoteID is the Warpnet id for a note we ingest: the note's own AP id,
+// which keeps it resolvable afterwards. The node asks its author's home node —
+// us — for that reply's stats, and a random token resolves to nothing there
+// ("remote URL must be https" on every thread open); the note url reaches the
+// remote status. It also makes a redelivery of the same note key to the same
+// reply instead of adding a second row. Bridged tweets read off a profile are
+// already keyed by their status url (see restBaseTweet).
+func ingestedNoteID(note map[string]any) string {
+	if id := stringField(note, "id"); id != "" {
+		return id
+	}
+	if u := stringField(note, "url"); u != "" {
+		return u
+	}
+	return randomToken()
 }
 
 // bridgedUserID is the Warpnet user id for a Fediverse actor whose activity we

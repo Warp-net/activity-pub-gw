@@ -758,7 +758,10 @@ func TestTranslateInbound(t *testing.T) {
 
 	route, payload, ok = g.translateInbound(map[string]any{
 		"type": "Create", "actor": actor,
-		"object": map[string]any{"type": "Note", "content": "<p>hi there</p>", "inReplyTo": status},
+		"object": map[string]any{
+			"type": "Note", "id": "https://m/users/bob/statuses/9",
+			"content": "<p>hi there</p>", "inReplyTo": status,
+		},
 	})
 	if !ok || route != routePostTweet {
 		t.Fatalf("reply: route=%q ok=%v", route, ok)
@@ -777,6 +780,10 @@ func TestTranslateInbound(t *testing.T) {
 	// thread showed "@ap:aHR0cHM6..." next to the name because they disagreed.
 	if reply.UserId != "bob@m" {
 		t.Fatalf("reply user_id = %q, want the bob@m handle", reply.UserId)
+	}
+	// And its own id is the note url, so the node can ask us for its stats.
+	if reply.Id != "https://m/users/bob/statuses/9" {
+		t.Fatalf("reply id = %q, want the note id", reply.Id)
 	}
 
 	// Quote-post convention: no inReplyTo, text opens with "RE: <status URL>".
