@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -29,8 +30,12 @@ func TestLoadOrCreateKey(t *testing.T) {
 		if serr != nil {
 			t.Fatalf("the key must be written to disk: %v", serr)
 		}
-		if perm := info.Mode().Perm(); perm != 0o600 {
-			t.Fatalf("mode = %v, want 0600 — the signing key must not be world-readable", perm)
+		// Windows has no Unix permission bits — Go reduces the mode to a
+		// read-only flag — so 0600 is unrepresentable there.
+		if runtime.GOOS != "windows" {
+			if perm := info.Mode().Perm(); perm != 0o600 {
+				t.Fatalf("mode = %v, want 0600 — the signing key must not be world-readable", perm)
+			}
 		}
 
 		// Signature stability across restarts is the whole point: reloading must

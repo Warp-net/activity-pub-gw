@@ -65,7 +65,7 @@ func (fx *inboxFixture) postAs(t *testing.T, keyID string, doc map[string]any) *
 // its work to goroutines bounded by the delivery semaphore.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return

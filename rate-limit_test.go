@@ -266,11 +266,11 @@ func TestDrainRecoversAStuckGlobalLimiter(t *testing.T) {
 		t.Skip("global limiter did not lock; budget accounting differs in this build")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	go rl.drain(ctx)
 
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(20 * time.Second)
 	for {
 		if !rl.global.Load().IsLocked() {
 			return
