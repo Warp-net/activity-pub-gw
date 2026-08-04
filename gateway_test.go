@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Warp-net/warpnet/domain"
 	"github.com/Warp-net/warpnet/retrier"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	log "github.com/sirupsen/logrus"
@@ -234,7 +235,7 @@ func TestBridgeDeleteFederatesTombstone(t *testing.T) {
 	g.client = srv.Client()
 
 	b := newMastodonBridge(g, "node1")
-	if err := b.Delete(context.Background(), deleteTweetRequest{
+	if err := b.Delete(context.Background(), deleteTweetEvent{
 		UserId: "alice", TweetId: "01REPLY00000000000000000000", ParentId: srv.URL + "/note",
 	}); err != nil {
 		t.Fatalf("Delete: %v", err)
@@ -319,7 +320,7 @@ func TestBridgeReplyEmbedsParentInNoteID(t *testing.T) {
 	b := newMastodonBridge(g, "node1")
 	parent := srv.URL + "/note"
 	pid := parent
-	if err := b.Reply(context.Background(), newReplyEvent{
+	if err := b.Reply(context.Background(), tweet{
 		UserId: "alice", Id: "r1", Text: "thank you!", RootId: parent, ParentId: &pid,
 	}); err != nil {
 		t.Fatalf("Reply: %v", err)
@@ -755,22 +756,28 @@ func TestTranslateInbound(t *testing.T) {
 	status := "https://gw.example/users/alice/statuses/t1"
 
 	route, payload, ok := g.translateInbound(map[string]any{"type": "Like", "actor": actor, "object": status})
-	if !ok || route != routePostLike {
-		t.Fatalf("like: route=%q ok=%v", route, ok)
+	if !ok || route != routePostReact {
+		t.Fatalf("favourite: route=%q ok=%v", route, ok)
 	}
-	// owner_id is the liker and user_id the liked tweet's author — the direction
-	// the node's like handler and the client use. With them swapped the node
-	// books the like as the author liking their own tweet, so the author gets no
-	// notification and the like is streamed back to the gateway.
-	like := payload.(likeEvent)
-	if like.TweetId != "t1" || like.UserId != "alice" {
-		t.Fatalf("like event: %+v", like)
+	// owner_id is the reactor and user_id the reacted tweet's author — the
+	// direction the node's reaction handler and the client use. With them swapped
+	// the node books it as the author reacting to their own tweet, so the author
+	// gets no notification and the reaction is streamed back to the gateway.
+	react := payload.(reactionEvent)
+	if react.TweetId != "t1" || react.UserId != "alice" {
+		t.Fatalf("reaction event: %+v", react)
+	}
+	// A Mastodon favourite is the default heart: warpnet stores reactions per
+	// emoji, so an empty one would read back as a bare like on an old client but
+	// leave the heart chip unpainted on a current one.
+	if react.Emoji != domain.DefaultReaction {
+		t.Fatalf("favourite emoji = %q, want the default heart", react.Emoji)
 	}
 	// A Fediverse actor is attributed by its "name@instance" handle — the id its
 	// bridged profile resolves under. An "ap:<base64url>" id here has no profile
 	// to open, so the client renders the raw id.
-	if like.OwnerId != "bob@m" {
-		t.Fatalf("liker id = %q, want the bob@m handle", like.OwnerId)
+	if react.OwnerId != "bob@m" {
+		t.Fatalf("reactor id = %q, want the bob@m handle", react.OwnerId)
 	}
 
 	route, payload, ok = g.translateInbound(map[string]any{
@@ -783,12 +790,12 @@ func TestTranslateInbound(t *testing.T) {
 	if !ok || route != routePostTweet {
 		t.Fatalf("reply: route=%q ok=%v", route, ok)
 	}
-	reply := payload.(newReplyEvent)
+	reply := payload.(tweet)
 	if reply.RootId != "t1" || reply.ParentId == nil || *reply.ParentId != "t1" || reply.Text != "hi there" {
 		t.Fatalf("reply event: %+v", reply)
 	}
-	if reply.ParentUserId != "alice" {
-		t.Fatalf("reply parent_user_id = %q, want alice", reply.ParentUserId)
+	if reply.ParentUserId == nil || *reply.ParentUserId != "alice" {
+		t.Fatalf("reply parent_user_id = %v, want alice", reply.ParentUserId)
 	}
 	if reply.Username != "bob@m" {
 		t.Fatalf("reply username = %q, want bob@m", reply.Username)
@@ -811,7 +818,7 @@ func TestTranslateInbound(t *testing.T) {
 	if !ok || route != routePostTweet {
 		t.Fatalf("RE reply: route=%q ok=%v", route, ok)
 	}
-	reply = payload.(newReplyEvent)
+	reply = payload.(tweet)
 	if reply.RootId != "t1" || reply.ParentId == nil || *reply.ParentId != "t1" || reply.Text != "nice post" {
 		t.Fatalf("RE reply event: %+v", reply)
 	}
@@ -896,8 +903,8 @@ func TestTranslateInbound(t *testing.T) {
 	if route, _, ok := g.translateInbound(map[string]any{
 		"type": "Undo", "actor": actor,
 		"object": map[string]any{"type": "Like", "object": status},
-	}); !ok || route != routePostUnlike {
-		t.Fatalf("undo like: route=%q ok=%v", route, ok)
+	}); !ok || route != routePostUnreact {
+		t.Fatalf("undo favourite: route=%q ok=%v", route, ok)
 	}
 
 	if route, payload, ok := g.translateInbound(map[string]any{
@@ -1247,7 +1254,7 @@ func TestServeStatus(t *testing.T) {
 			t.Fatalf("status = %d", resp.StatusCode)
 		}
 		// the node is asked with parent_id so it can find the reply in the thread
-		gt, ok := fr.lastPayload.(getTweetRequest)
+		gt, ok := fr.lastPayload.(getTweetEvent)
 		if !ok || gt.ParentId != parent || gt.TweetId != "r1" {
 			t.Fatalf("payload = %+v", fr.lastPayload)
 		}
@@ -1383,8 +1390,8 @@ func TestGetRepliesDereferencesURIItems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if len(resp.Replies) != 2 {
-		t.Fatalf("replies = %d, want 2: %+v", len(resp.Replies), resp.Replies)
+	if len(resp.Tweets) != 2 {
+		t.Fatalf("replies = %d, want 2: %+v", len(resp.Tweets), resp.Tweets)
 	}
 }
 
@@ -1424,10 +1431,10 @@ func TestGetRepliesUsesMastodonContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if len(resp.Replies) != 2 {
-		t.Fatalf("replies = %d, want 2: %+v", len(resp.Replies), resp.Replies)
+	if len(resp.Tweets) != 2 {
+		t.Fatalf("replies = %d, want 2: %+v", len(resp.Tweets), resp.Tweets)
 	}
-	r0 := resp.Replies[0].Reply
+	r0 := resp.Tweets[0]
 	if r0.Id != srv.URL+"/users/bob/statuses/101" {
 		t.Errorf("r0.Id = %q, want the AP uri", r0.Id)
 	}
@@ -1440,7 +1447,7 @@ func TestGetRepliesUsesMastodonContext(t *testing.T) {
 	if r0.ParentId == nil || *r0.ParentId != root { // in_reply_to 100 -> root URL
 		t.Errorf("r0.ParentId = %v, want %q", r0.ParentId, root)
 	}
-	r1 := resp.Replies[1].Reply
+	r1 := resp.Tweets[1]
 	if r1.UserId != "carol@other.example" { // already a full handle: keep as-is
 		t.Errorf("r1.UserId = %q, want carol@other.example", r1.UserId)
 	}
@@ -1550,7 +1557,7 @@ func TestGetTweetsOrRepliesServesThreadReplies(t *testing.T) {
 
 	b := newMastodonBridge(g, "node1")
 	root := srv.URL + "/users/alice/statuses/100"
-	resp, err := b.GetTweetsOrReplies(context.Background(), getTweetsRequest{RootId: root})
+	resp, err := b.GetTweetsOrReplies(context.Background(), getAllTweetsEvent{RootId: root})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -1604,8 +1611,14 @@ func TestGetTweetAndStatsUseMastodonREST(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTweetStats err: %v", err)
 	}
-	if stats.LikeCount != 5 || stats.RetweetsCount != 2 || stats.RepliesCount != 3 {
-		t.Errorf("stats = %+v, want likes=5 boosts=2 replies=3", stats)
+	if stats.ReactionsCount != 5 || stats.RetweetsCount != 2 || stats.RepliesCount != 3 {
+		t.Errorf("stats = %+v, want favourites=5 boosts=2 replies=3", stats)
+	}
+	// Every favourite reads back as the default heart, and the client paints its
+	// reaction chips from this breakdown — without it a favourited status shows
+	// no chip at all despite the non-zero count.
+	if stats.Reactions[domain.DefaultReaction] != 5 {
+		t.Errorf("stats.Reactions = %v, want 5 hearts", stats.Reactions)
 	}
 }
 
@@ -1921,8 +1934,8 @@ func TestSelfLoopRefused(t *testing.T) {
 			t.Errorf("postSigned: err = %v, want errSelfTarget", err)
 		}
 		// A status of ours is not a Mastodon note either (Like/Reply/Delete).
-		if _, err := b.Like(ctx, "alice", g.actorID("alice")+pathStatuses+"1", false); !errors.Is(err, errSelfTarget) {
-			t.Errorf("Like: err = %v, want errSelfTarget", err)
+		if _, err := b.React(ctx, "alice", g.actorID("alice")+pathStatuses+"1", domain.DefaultReaction, false); !errors.Is(err, errSelfTarget) {
+			t.Errorf("React: err = %v, want errSelfTarget", err)
 		}
 	})
 

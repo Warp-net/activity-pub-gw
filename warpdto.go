@@ -43,20 +43,22 @@ const (
 	routeGetUsers      = event.PUBLIC_GET_USERS
 	routeGetTweet      = event.PUBLIC_GET_TWEET
 	routeGetTweets     = event.PUBLIC_GET_TWEETS
-	routeGetReplies    = event.PUBLIC_GET_REPLIES
 	routeGetFollowers  = event.PUBLIC_GET_FOLLOWERS
 	routeGetFollowings = event.PUBLIC_GET_FOLLOWINGS
 	routeGetImage      = event.PUBLIC_GET_IMAGE
 	routePostFollow    = event.PUBLIC_POST_FOLLOW
 	routePostUnfollow  = event.PUBLIC_POST_UNFOLLOW
-	routePostLike      = event.PUBLIC_POST_LIKE
-	routePostUnlike    = event.PUBLIC_POST_UNLIKE
+	// routePostReact/routePostUnreact are warpnet's reaction routes; they
+	// replaced the binary like/unlike ones. A reaction carries an emoji, and
+	// the heart (domain.DefaultReaction) is the one that maps to a Mastodon
+	// favourite — see mastodonBridge.React.
+	routePostReact     = event.PUBLIC_POST_REACT
+	routePostUnreact   = event.PUBLIC_POST_UNREACT
 	routePostRetweet   = event.PUBLIC_POST_RETWEET
 	routePostUnretweet = event.PUBLIC_POST_UNRETWEET
-	routePostReply     = event.PUBLIC_POST_REPLY
 	// routePostTweet is the route warpnet forwards replies over after it
 	// consolidated replies into the tweet path (a reply is a tweet with a
-	// parent); it superseded the standalone PUBLIC_POST_REPLY route.
+	// parent); it superseded the standalone reply route.
 	routePostTweet = event.PRIVATE_POST_TWEET
 	// routeDeleteTweet is the route warpnet forwards a reply deletion over to
 	// the parent author's node.
@@ -70,55 +72,23 @@ type (
 	user    = domain.User
 )
 
-// Request/response event payloads (warpnet's own types).
+// Request/response event payloads (warpnet's own types). GetAllTweetsEvent and
+// GetTweetEvent now carry root_id/parent_id themselves, so the thread ids the
+// gateway needs no longer have to be decoded into local shadow structs.
 type (
 	getUserEvent       = event.GetUserEvent
 	getAllUsersEvent   = event.GetAllUsersEvent
 	usersResponse      = event.UsersResponse
 	getTweetEvent      = event.GetTweetEvent
-	getRepliesEvent    = event.GetAllRepliesEvent
 	getAllTweetsEvent  = event.GetAllTweetsEvent
 	tweetsResponse     = event.TweetsResponse
-	repliesResponse    = event.RepliesResponse
 	getFollowersEvent  = event.GetAllTweetsEvent // {user_id, cursor}; same shape for followers/followings
 	followersResponse  = event.FollowersResponse
 	followingsResponse = event.FollowingsResponse
 	newFollowEvent     = event.NewFollowEvent
-	likeEvent          = event.LikeEvent
+	reactionEvent      = event.ReactionEvent
 	unretweetEvent     = event.UnretweetEvent
-	newReplyEvent      = event.NewReplyEvent
+	deleteTweetEvent   = event.DeleteTweetEvent
 	getImageEvent      = event.GetImageEvent
 	getImageResponse   = event.GetImageResponse
 )
-
-// getTweetsRequest is the PUBLIC_GET_TWEETS body. Warpnet folded thread replies
-// into this route (a profile request carries only user_id; a thread-replies
-// request carries root_id/parent_id), but the pinned event.GetAllTweetsEvent
-// predates the reply fields, so decode them here to dispatch on them.
-type getTweetsRequest struct {
-	UserId   string  `json:"user_id"`
-	RootId   string  `json:"root_id"`
-	ParentId string  `json:"parent_id"`
-	Cursor   *string `json:"cursor,omitempty"`
-}
-
-// deleteTweetRequest is the PRIVATE_DELETE_TWEET body warpnet forwards for a
-// reply deletion. The pinned event.DeleteTweetEvent (= GetTweetEvent) predates
-// the thread ids, so decode parent_id/root_id here to locate the parent note.
-type deleteTweetRequest struct {
-	UserId   string `json:"user_id"`
-	TweetId  string `json:"tweet_id"`
-	ParentId string `json:"parent_id"`
-	RootId   string `json:"root_id"`
-}
-
-// getTweetRequest is the PUBLIC_GET_TWEET body. The pinned event.GetTweetEvent
-// predates parent_id/root_id, but the node needs the parent to resolve a reply
-// (replies are keyed under their parent, not the author's timeline), so send
-// them explicitly when serving a reply status.
-type getTweetRequest struct {
-	UserId   string `json:"user_id"`
-	TweetId  string `json:"tweet_id"`
-	ParentId string `json:"parent_id,omitempty"`
-	RootId   string `json:"root_id,omitempty"`
-}

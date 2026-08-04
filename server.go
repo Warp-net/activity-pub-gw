@@ -531,7 +531,7 @@ func (g *gateway) serveReplies(w http.ResponseWriter, user, tweetID string) {
 		g.serveEmptyCollection(w, id)
 		return
 	}
-	bt, err := g.req.requestUser(user, routeGetTweets, getTweetsRequest{UserId: user, ParentId: tweetID})
+	bt, err := g.req.requestUser(user, routeGetTweets, getAllTweetsEvent{UserId: user, ParentId: tweetID})
 	if err != nil {
 		log.Warnf("replies: fetch %s/%s: %v", user, tweetID, err)
 		g.serveEmptyCollection(w, id)

@@ -199,20 +199,15 @@ func pageCursor(cursor *string) string {
 
 // GetTweetsOrReplies serves the PUBLIC_GET_TWEETS route. Warpnet folded thread
 // replies into it: a plain profile request carries only a userId (handle),
-// while a thread-replies request carries root_id/parent_id (the note whose
-// replies are wanted) and expects the replies back as a flat TweetsResponse,
-// not the RepliesResponse tree.
-func (b *mastodonBridge) GetTweetsOrReplies(ctx context.Context, ev getTweetsRequest) (tweetsResponse, error) {
+// while a thread-replies request carries root_id/parent_id — the note whose
+// replies are wanted.
+func (b *mastodonBridge) GetTweetsOrReplies(ctx context.Context, ev getAllTweetsEvent) (tweetsResponse, error) {
 	if ev.RootId != "" || ev.ParentId != "" {
 		id := ev.ParentId
 		if id == "" {
 			id = ev.RootId
 		}
-		rr, err := b.GetReplies(ctx, id)
-		if err != nil {
-			return tweetsResponse{}, err
-		}
-		return repliesToTweets(rr), nil
+		return b.GetReplies(ctx, id)
 	}
 	return b.GetTweets(ctx, ev.UserId, ev.Cursor)
 }
@@ -451,34 +446,21 @@ func (b *mastodonBridge) apTweet(ctx context.Context, noteURL string) (tweet, er
 	return t, nil
 }
 
-// GetReplies returns a flat list of a Note's replies. Mastodon-family instances
-// expose the whole thread via one REST call (/api/v1/statuses/{id}/context), so
-// try that first — it is a single unauthenticated request that returns every
-// descendant as a full status, instead of dereferencing each reply URI from the
-// slow, often-partial ActivityPub replies collection. Non-Mastodon servers
-// (no /context) fall back to the AP walk.
-func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (repliesResponse, error) {
+// GetReplies returns a Note's replies as the flat tweet list warpnet's folded
+// reply route (PUBLIC_GET_TWEETS with root_id/parent_id) answers with — the
+// reply tree it used to return is gone from the wire contract. Mastodon-family
+// instances expose the whole thread via one REST call
+// (/api/v1/statuses/{id}/context), so try that first — it is a single
+// unauthenticated request that returns every descendant as a full status,
+// instead of dereferencing each reply URI from the slow, often-partial
+// ActivityPub replies collection. Non-Mastodon servers (no /context) fall back
+// to the AP walk.
+func (b *mastodonBridge) GetReplies(ctx context.Context, noteURL string) (tweetsResponse, error) {
 	noteURL = strings.TrimPrefix(noteURL, domain.RetweetPrefix)
 	if resp, ok := b.contextReplies(ctx, noteURL); ok {
 		return resp, nil
 	}
 	return b.apReplies(ctx, noteURL)
-}
-
-// repliesToTweets flattens a reply tree into the flat TweetsResponse that
-// warpnet's folded reply route (PUBLIC_GET_TWEETS with root_id/parent_id)
-// returns — the client parses the response as a plain tweet list, not a tree.
-func repliesToTweets(rr repliesResponse) tweetsResponse {
-	resp := tweetsResponse{Tweets: []tweet{}}
-	var walk func([]domain.ReplyNode)
-	walk = func(nodes []domain.ReplyNode) {
-		for _, n := range nodes {
-			resp.Tweets = append(resp.Tweets, n.Reply)
-			walk(n.Children)
-		}
-	}
-	walk(rr.Replies)
-	return resp
 }
 
 // maxReplies bounds how many replies GetReplies returns from either path.
@@ -487,19 +469,19 @@ const maxReplies = 50
 // contextReplies fetches the whole thread via the Mastodon REST context endpoint
 // and flattens its descendants into replies. ok is false when the instance is
 // not Mastodon-compatible (no /context), so the caller falls back to AP.
-func (b *mastodonBridge) contextReplies(ctx context.Context, noteURL string) (repliesResponse, bool) {
+func (b *mastodonBridge) contextReplies(ctx context.Context, noteURL string) (tweetsResponse, bool) {
 	host, id, ok := restStatusRef(noteURL)
 	if !ok {
-		return repliesResponse{}, false
+		return tweetsResponse{}, false
 	}
 	ctxURL := "https://" + host + "/api/v1/statuses/" + id + "/context"
 	m, err := b.ap.apGetJSON(ctx, ctxURL, "application/json")
 	if err != nil {
-		return repliesResponse{}, false // not Mastodon / not reachable -> AP fallback
+		return tweetsResponse{}, false // not Mastodon / not reachable -> AP fallback
 	}
 	desc, hasDesc := m["descendants"]
 	if _, hasAnc := m["ancestors"]; !hasDesc && !hasAnc {
-		return repliesResponse{}, false // not a context document
+		return tweetsResponse{}, false // not a context document
 	}
 	items := asSlice(desc)
 	// Map each status's REST id to its ActivityPub uri so a reply's parent can be
@@ -513,13 +495,13 @@ func (b *mastodonBridge) contextReplies(ctx context.Context, noteURL string) (re
 			}
 		}
 	}
-	resp := repliesResponse{Replies: []domain.ReplyNode{}}
+	resp := tweetsResponse{Tweets: []tweet{}}
 	for _, it := range items {
-		if len(resp.Replies) >= maxReplies {
+		if len(resp.Tweets) >= maxReplies {
 			break
 		}
 		if t, ok := restReplyToTweet(host, asMap(it), noteURL, idToURI); ok {
-			resp.Replies = append(resp.Replies, domain.ReplyNode{Reply: t})
+			resp.Tweets = append(resp.Tweets, t)
 		}
 	}
 	return resp, true
@@ -636,12 +618,12 @@ func restReplyToTweet(host string, s map[string]any, rootURL string, idToURI map
 // apReplies reads a Note's replies collection over ActivityPub, walking a
 // bounded number of pages and dereferencing items that are note URIs. Used as
 // the fallback for instances without the Mastodon REST context endpoint.
-func (b *mastodonBridge) apReplies(ctx context.Context, noteURL string) (repliesResponse, error) {
+func (b *mastodonBridge) apReplies(ctx context.Context, noteURL string) (tweetsResponse, error) {
 	m, err := b.ap.apGetJSON(ctx, noteURL, contentTypeAP)
 	if err != nil {
-		return repliesResponse{}, err
+		return tweetsResponse{}, err
 	}
-	resp := repliesResponse{Replies: []domain.ReplyNode{}}
+	resp := tweetsResponse{Tweets: []tweet{}}
 	repliesURL := asString(m["replies"])
 	if repliesURL == "" {
 		return resp, nil
@@ -659,7 +641,7 @@ func (b *mastodonBridge) apReplies(ctx context.Context, noteURL string) (replies
 	// as note URIs (strings), so each is dereferenced; some servers inline the
 	// note objects instead. Bounded so a long thread can't run unbounded fetches.
 	const maxPages = 5
-	for p := 0; p < maxPages && len(resp.Replies) < maxReplies; p++ {
+	for p := 0; p < maxPages && len(resp.Tweets) < maxReplies; p++ {
 		if page == nil {
 			if pageURL == "" {
 				break
@@ -673,10 +655,10 @@ func (b *mastodonBridge) apReplies(ctx context.Context, noteURL string) (replies
 		if len(items) == 0 {
 			items = asSlice(page["orderedItems"]) // Mastodon uses items; others orderedItems
 		}
-		if room := maxReplies - len(resp.Replies); len(items) > room {
+		if room := maxReplies - len(resp.Tweets); len(items) > room {
 			items = items[:room] // never dereference more than we can keep
 		}
-		resp.Replies = append(resp.Replies, b.resolveReplyItems(ctx, items)...)
+		resp.Tweets = append(resp.Tweets, b.resolveReplyItems(ctx, items)...)
 		pageURL = asString(page["next"])
 		page = nil
 	}
@@ -687,7 +669,7 @@ func (b *mastodonBridge) apReplies(ctx context.Context, noteURL string) (replies
 // order. Each item is usually a note URI needing its own fetch (plus a possible
 // quoted-author fetch), so a long thread would otherwise serialize dozens of
 // round-trips; a bounded pool keeps the fan-out gentle on the remote instance.
-func (b *mastodonBridge) resolveReplyItems(ctx context.Context, items []any) []domain.ReplyNode {
+func (b *mastodonBridge) resolveReplyItems(ctx context.Context, items []any) []tweet {
 	const maxConcurrent = 8
 	out := make([]tweet, len(items))
 	ok := make([]bool, len(items))
@@ -716,30 +698,34 @@ func (b *mastodonBridge) resolveReplyItems(ctx context.Context, items []any) []d
 		}()
 	}
 	wg.Wait()
-	replies := make([]domain.ReplyNode, 0, len(items))
+	replies := make([]tweet, 0, len(items))
 	for i := range items {
 		if ok[i] {
-			replies = append(replies, domain.ReplyNode{Reply: out[i]})
+			replies = append(replies, out[i])
 		}
 	}
 	return replies
 }
 
-// GetTweetStats reads the like/boost/reply counts for a status. Mastodon's REST
-// status carries them directly (favourites_count/reblogs_count/replies_count) —
-// which the AP Note does not federate (likes/shares are usually absent, so the
-// AP path reports 0) — so prefer REST and fall back to the AP collections.
+// GetTweetStats reads the favourite/boost/reply counts for a status. Mastodon's
+// REST status carries them directly
+// (favourites_count/reblogs_count/replies_count) — which the AP Note does not
+// federate (likes/shares are usually absent, so the AP path reports 0) — so
+// prefer REST and fall back to the AP collections.
+//
+// MyReaction is deliberately left empty: the gateway is stateless and holds no
+// Warpnet user's own reaction. The node that asked overwrites the field from its
+// local store before handing the stats to its client.
 func (b *mastodonBridge) GetTweetStats(ctx context.Context, noteURL string) (event.TweetStatsResponse, error) {
 	noteURL = strings.TrimPrefix(noteURL, domain.RetweetPrefix)
 	if host, id, ok := restStatusRef(noteURL); ok {
 		if m, err := b.ap.apGetJSON(ctx, "https://"+host+"/api/v1/statuses/"+id, "application/json"); err == nil {
 			if _, isStatus := m["replies_count"]; isStatus {
-				return event.TweetStatsResponse{
-					TweetId:       domain.ID(noteURL),
-					LikeCount:     numField(m["favourites_count"]),
-					RetweetsCount: numField(m["reblogs_count"]),
-					RepliesCount:  numField(m["replies_count"]),
-				}, nil
+				return tweetStats(noteURL,
+					numField(m["favourites_count"]),
+					numField(m["reblogs_count"]),
+					numField(m["replies_count"]),
+				), nil
 			}
 		}
 	}
@@ -750,12 +736,28 @@ func (b *mastodonBridge) GetTweetStats(ctx context.Context, noteURL string) (eve
 	if inner := asMap(m["object"]); inner != nil {
 		m = inner
 	}
-	return event.TweetStatsResponse{
-		TweetId:       domain.ID(noteURL),
-		LikeCount:     apCollectionCount(m["likes"]),
-		RetweetsCount: apCollectionCount(m["shares"]),
-		RepliesCount:  apCollectionCount(m["replies"]),
-	}, nil
+	return tweetStats(noteURL,
+		apCollectionCount(m["likes"]),
+		apCollectionCount(m["shares"]),
+		apCollectionCount(m["replies"]),
+	), nil
+}
+
+// tweetStats builds the stats response for a bridged status. Every Mastodon
+// favourite reads back as the default heart, so the per-emoji breakdown the
+// client paints its reaction chips from holds exactly that one entry — without
+// it a favourited status would render no chip at all despite a non-zero count.
+func tweetStats(noteURL string, favourites, boosts, replies uint64) event.TweetStatsResponse {
+	resp := event.TweetStatsResponse{
+		TweetId:        domain.ID(noteURL),
+		ReactionsCount: favourites,
+		RetweetsCount:  boosts,
+		RepliesCount:   replies,
+	}
+	if favourites > 0 {
+		resp.Reactions = map[string]uint64{domain.DefaultReaction: favourites}
+	}
+	return resp
 }
 
 // numField reads a JSON number (Mastodon REST count) as a uint64; 0 otherwise.
@@ -847,8 +849,18 @@ func (b *mastodonBridge) GetImage(ctx context.Context, rawURL string) (getImageR
 
 // --- writes (Warpnet -> Mastodon) ---
 
-// Like federates a like (or its undo) and returns the status's like count.
-func (b *mastodonBridge) Like(ctx context.Context, localUser, objectURL string, undo bool) (uint64, error) {
+// React federates a Warpnet reaction (or its undo) as an AP Like — a Mastodon
+// favourite — and returns the status's favourite count. emoji must already be
+// normalized (see domain.NormalizeReaction); an undo names none.
+//
+// Mastodon has one reaction, the favourite, so only the default heart maps onto
+// it; emoji reactions are a Pleroma/Misskey extension the Mastodon inbox would
+// reject. Any other emoji is therefore accepted and dropped rather than
+// federated as a favourite the reactor did not intend.
+func (b *mastodonBridge) React(ctx context.Context, localUser, objectURL, emoji string, undo bool) (uint64, error) {
+	if !undo && emoji != domain.DefaultReaction {
+		return 0, nil
+	}
 	note, inbox, err := b.authorInbox(ctx, objectURL)
 	if err != nil {
 		return 0, err
@@ -905,11 +917,12 @@ func mentionOf(authorActorURL, parentURL string) []mentionTag {
 	return []mentionTag{m}
 }
 
-// Reply federates a Warpnet reply as a Create(Note) inReplyTo the parent.
-func (b *mastodonBridge) Reply(ctx context.Context, ev newReplyEvent) error {
-	parentURL := string(ev.RootId)
+// Reply federates a Warpnet reply as a Create(Note) inReplyTo the parent. The
+// reply arrives as a tweet carrying a parent — warpnet's folded reply shape.
+func (b *mastodonBridge) Reply(ctx context.Context, ev tweet) error {
+	parentURL := ev.RootId
 	if ev.ParentId != nil && *ev.ParentId != "" {
-		parentURL = string(*ev.ParentId)
+		parentURL = *ev.ParentId
 	}
 	obj, inbox, err := b.authorInbox(ctx, parentURL)
 	if err != nil {
@@ -918,12 +931,12 @@ func (b *mastodonBridge) Reply(ctx context.Context, ev newReplyEvent) error {
 	// Address the parent author (To) with the public collection in Cc, so the
 	// reply is delivered/notified to them and shown publicly, not just threaded.
 	author := asString(obj["attributedTo"])
-	localUser := string(ev.UserId)
+	localUser := ev.UserId
 	actorID := b.ap.actorID(localUser)
 	// Reuse the node-assigned reply id in the deterministic /statuses/{id}
 	// scheme: retries then dedupe on the remote side, and the id stays
 	// dereferenceable via serveStatus instead of dangling.
-	noteID := string(ev.Id)
+	noteID := ev.Id
 	if noteID == "" {
 		noteID = randomToken()
 	}
@@ -951,7 +964,7 @@ func (b *mastodonBridge) Reply(ctx context.Context, ev newReplyEvent) error {
 // Delete federates the deletion of a Warpnet reply to a Mastodon note as an AP
 // Delete(Tombstone) addressed to the parent author, mirroring the Create that
 // Reply sent. The deleted Note id is the same deterministic /statuses/{id} url.
-func (b *mastodonBridge) Delete(ctx context.Context, ev deleteTweetRequest) error {
+func (b *mastodonBridge) Delete(ctx context.Context, ev deleteTweetEvent) error {
 	parentURL := ev.RootId
 	if ev.ParentId != "" {
 		parentURL = ev.ParentId

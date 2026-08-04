@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Warp-net/warpnet/domain"
 )
 
 // inboxFixture wires a gateway to an in-process peer instance whose actor "bob"
@@ -246,8 +248,8 @@ func TestHandleInboxForwardsTranslatedActivities(t *testing.T) {
 		if w.Code != http.StatusAccepted {
 			t.Fatalf("status = %d", w.Code)
 		}
-		waitFor(t, "the like to be forwarded", func() bool { return fr.route() == routePostLike })
-		ev, ok := fr.payload().(likeEvent)
+		waitFor(t, "the favourite to be forwarded", func() bool { return fr.route() == routePostReact })
+		ev, ok := fr.payload().(reactionEvent)
 		if !ok {
 			t.Fatalf("payload type %T", fr.lastPayload)
 		}
@@ -255,7 +257,10 @@ func TestHandleInboxForwardsTranslatedActivities(t *testing.T) {
 			t.Fatalf("payload = %+v", ev)
 		}
 		if string(ev.OwnerId) != "bob@"+fx.peer.host() {
-			t.Fatalf("OwnerId = %q, want the liker's handle", ev.OwnerId)
+			t.Fatalf("OwnerId = %q, want the reactor's handle", ev.OwnerId)
+		}
+		if ev.Emoji != domain.DefaultReaction {
+			t.Fatalf("Emoji = %q, want the default heart a favourite maps to", ev.Emoji)
 		}
 	})
 

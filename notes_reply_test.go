@@ -55,33 +55,6 @@ func TestBuildNoteThreadsReplies(t *testing.T) {
 	}
 }
 
-// TestReplyEventFromTweet verifies a reply forwarded over the private tweet
-// route (a tweet with a parent) is adapted into the reply event the bridge
-// federates, carrying the thread ids, author and text.
-func TestReplyEventFromTweet(t *testing.T) {
-	parent := "https://m/users/bob/statuses/9"
-	pid := parent
-	in := tweet{
-		Id:        "01REPLY00000000000000000000",
-		ParentId:  &pid,
-		RootId:    "https://m/users/bob/statuses/1",
-		Text:      "Cool!",
-		UserId:    "01USER0000000000000000000",
-		Username:  "Vadim",
-		CreatedAt: time.Unix(0, 0),
-	}
-	re := replyEventFromTweet(in)
-	if re.ParentId == nil || *re.ParentId != parent {
-		t.Fatalf("ParentId = %v, want %q", re.ParentId, parent)
-	}
-	if re.Id != "01REPLY00000000000000000000" || re.RootId != "https://m/users/bob/statuses/1" {
-		t.Fatalf("ids: %+v", re)
-	}
-	if re.Text != "Cool!" || re.UserId != "01USER0000000000000000000" || re.Username != "Vadim" {
-		t.Fatalf("fields: %+v", re)
-	}
-}
-
 // TestMentionOf verifies a federated reply carries a Mention of the parent
 // author: without it Mastodon threads the reply but never notifies them.
 func TestMentionOf(t *testing.T) {
@@ -105,7 +78,7 @@ func TestMentionOf(t *testing.T) {
 
 // TestServeRepliesUsesTweetsAPI verifies the replies collection is sourced from
 // PUBLIC_GET_TWEETS with the note as parent_id (warpnet retired the standalone
-// PUBLIC_GET_REPLIES route), and that fediverse-authored replies are skipped.
+// replies route), and that fediverse-authored replies are skipped.
 func TestServeRepliesUsesTweetsAPI(t *testing.T) {
 	g := testGateway(t)
 	parent := "01PARENT0000000000000000000"
@@ -134,7 +107,7 @@ func TestServeRepliesUsesTweetsAPI(t *testing.T) {
 	if fr.lastRoute != routeGetTweets {
 		t.Fatalf("route = %q, want %q", fr.lastRoute, routeGetTweets)
 	}
-	req, ok := fr.lastPayload.(getTweetsRequest)
+	req, ok := fr.lastPayload.(getAllTweetsEvent)
 	if !ok || req.ParentId != parent || req.UserId != "alice" {
 		t.Fatalf("payload = %+v", fr.lastPayload)
 	}

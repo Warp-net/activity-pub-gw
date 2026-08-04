@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Warp-net/warpnet/domain"
 	"github.com/Warp-net/warpnet/event"
 	wjson "github.com/Warp-net/warpnet/json"
 	"github.com/Warp-net/warpnet/security"
@@ -193,13 +194,13 @@ func TestNodeServerRejectsUnauthenticatedEnvelopes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ts := time.Now()
-		env, merr := wjson.Marshal(message{
+		msg := message{
 			Body: wjson.RawMessage(body), MessageId: "m2",
 			NodeId: fx.client.h.ID().String(), Destination: routeGetUser,
-			Timestamp: ts, Version: "0.0.0",
-			Signature: security.Sign(other, signingInput(body, ts)),
-		})
+			Timestamp: time.Now(), Version: "0.0.0",
+		}
+		msg.Signature = security.Sign(other, msg.SigningBytes())
+		env, merr := wjson.Marshal(msg)
 		if merr != nil {
 			t.Fatal(merr)
 		}
@@ -282,29 +283,26 @@ func TestNodeServerReadRoutes(t *testing.T) {
 	t.Run("get tweet stats", func(t *testing.T) {
 		var stats event.TweetStatsResponse
 		fx.call(t, event.PUBLIC_GET_TWEET_STATS, getTweetEvent{TweetId: noteURL}, &stats)
-		if stats.LikeCount != 4 || stats.RetweetsCount != 1 || stats.RepliesCount != 2 {
+		if stats.ReactionsCount != 4 || stats.RetweetsCount != 1 || stats.RepliesCount != 2 {
 			t.Fatalf("stats = %+v", stats)
+		}
+		if stats.Reactions[domain.DefaultReaction] != 4 {
+			t.Fatalf("stats.Reactions = %v, want the favourites as hearts", stats.Reactions)
 		}
 	})
 
-	t.Run("get replies by parent and by root", func(t *testing.T) {
-		for _, ev := range []getRepliesEvent{
+	// Warpnet folded thread replies into the tweets route, keyed by parent_id or
+	// root_id; the standalone replies route it used to serve is gone.
+	t.Run("get tweets folded into thread replies", func(t *testing.T) {
+		for _, ev := range []getAllTweetsEvent{
 			{ParentId: noteURL},
 			{RootId: noteURL},
 		} {
-			var resp repliesResponse
-			fx.call(t, routeGetReplies, ev, &resp)
-			if len(resp.Replies) != 1 || resp.Replies[0].Reply.Text != "a reply" {
-				t.Fatalf("replies = %+v", resp.Replies)
+			var resp tweetsResponse
+			fx.call(t, routeGetTweets, ev, &resp)
+			if len(resp.Tweets) != 1 || resp.Tweets[0].Text != "a reply" {
+				t.Fatalf("tweets = %+v", resp.Tweets)
 			}
-		}
-	})
-
-	t.Run("get tweets folded into thread replies", func(t *testing.T) {
-		var resp tweetsResponse
-		fx.call(t, routeGetTweets, getTweetsRequest{ParentId: noteURL}, &resp)
-		if len(resp.Tweets) != 1 || resp.Tweets[0].Text != "a reply" {
-			t.Fatalf("tweets = %+v", resp.Tweets)
 		}
 	})
 
@@ -354,19 +352,73 @@ func TestNodeServerWriteRoutes(t *testing.T) {
 		"likes":     map[string]any{"totalItems": float64(3)},
 	})
 
-	t.Run("like and unlike", func(t *testing.T) {
-		var resp event.LikesCountResponse
-		fx.call(t, routePostLike, likeEvent{OwnerId: "alice", TweetId: noteURL}, &resp)
+	t.Run("react and unreact", func(t *testing.T) {
+		var resp event.ReactionsCountResponse
+		fx.call(t, routePostReact, reactionEvent{
+			OwnerId: "alice", TweetId: noteURL, Emoji: domain.DefaultReaction,
+		}, &resp)
 		if resp.Count != 4 {
 			t.Fatalf("count = %d", resp.Count)
 		}
-		fx.call(t, routePostUnlike, likeEvent{OwnerId: "alice", TweetId: noteURL}, &resp)
+		if resp.Reactions[domain.DefaultReaction] != 4 {
+			t.Fatalf("reactions = %v, want the count attributed to the heart", resp.Reactions)
+		}
+		fx.call(t, routePostUnreact, reactionEvent{OwnerId: "alice", TweetId: noteURL}, &resp)
 		if resp.Count != 2 {
 			t.Fatalf("undo count = %d", resp.Count)
 		}
 		got := f.delivered()
 		if len(got) != 2 || got[0].doc["type"] != typeLike || got[1].doc["type"] != typeUndo {
 			t.Fatalf("delivered = %+v", got)
+		}
+	})
+
+	// The node forwards whatever emoji the client sent, and a client that
+	// predates reactions sends none — which warpnet reads as the default heart.
+	// Dropping it here would lose the favourite for every such client.
+	t.Run("a react with no emoji is favourited as the default heart", func(t *testing.T) {
+		before := len(f.delivered())
+		var resp event.ReactionsCountResponse
+		fx.call(t, routePostReact, reactionEvent{OwnerId: "alice", TweetId: noteURL}, &resp)
+		if resp.Count != 4 {
+			t.Fatalf("count = %d, want the favourite counted", resp.Count)
+		}
+		if resp.Reactions[domain.DefaultReaction] != 4 {
+			t.Fatalf("reactions = %v, want the count under the default heart", resp.Reactions)
+		}
+		got := f.delivered()[before:]
+		if len(got) != 1 || got[0].doc["type"] != typeLike {
+			t.Fatalf("delivered = %+v, want a favourite", got)
+		}
+	})
+
+	// A reaction whose emoji cannot be a database key is refused, like the node
+	// refuses it locally — not silently swallowed.
+	t.Run("a malformed emoji is an error", func(t *testing.T) {
+		bt, err := fx.client.request(routePostReact, reactionEvent{
+			OwnerId: "alice", TweetId: noteURL, Emoji: "a/b",
+		})
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		if rerr := nodeResponseError(bt); rerr == nil {
+			t.Fatalf("response = %s, want an error envelope", bt)
+		}
+	})
+
+	// Mastodon has one reaction, the favourite, so only the default heart maps
+	// onto it — any other emoji must be accepted without federating a favourite.
+	t.Run("a non-heart reaction is accepted but not federated", func(t *testing.T) {
+		before := len(f.delivered())
+		var resp event.ReactionsCountResponse
+		fx.call(t, routePostReact, reactionEvent{
+			OwnerId: "alice", TweetId: noteURL, Emoji: "\U0001F525",
+		}, &resp)
+		if resp.Count != 0 {
+			t.Fatalf("count = %d, want 0: no favourite was made", resp.Count)
+		}
+		if now := len(f.delivered()); now != before {
+			t.Fatalf("delivered %d activities, want none", now-before)
 		}
 	})
 
@@ -381,26 +433,8 @@ func TestNodeServerWriteRoutes(t *testing.T) {
 		}
 	})
 
-	t.Run("reply", func(t *testing.T) {
-		before := len(f.delivered())
-		var echoed tweet
-		fx.call(t, routePostReply, newReplyEvent{
-			Id: "r1", UserId: "alice", RootId: noteURL, Text: "nice", CreatedAt: time.Unix(0, 0),
-		}, &echoed)
-		// The reply is echoed back as a tweet so the Warpnet UI renders it.
-		if echoed.Id != "r1" || echoed.Network != mastodonNetwork {
-			t.Fatalf("echo = %+v", echoed)
-		}
-		if echoed.ParentId == nil || *echoed.ParentId != noteURL {
-			t.Fatalf("echo parent = %v", echoed.ParentId)
-		}
-		got := f.delivered()[before:]
-		if len(got) != 1 || got[0].doc["type"] != typeCreate {
-			t.Fatalf("delivered = %+v", got)
-		}
-	})
-
-	// Warpnet forwards a reply over the private tweet route; a top-level post
+	// Warpnet forwards a reply over the private tweet route — a reply is a tweet
+	// carrying a parent, and the standalone reply route is gone. A top-level post
 	// arrives here through follower gossip and is federated in real time.
 	t.Run("private tweet route: a reply federates as a reply", func(t *testing.T) {
 		before := len(f.delivered())
@@ -410,7 +444,8 @@ func TestNodeServerWriteRoutes(t *testing.T) {
 			Id: "r2", ParentId: &parent, RootId: noteURL, UserId: "alice",
 			Text: "threaded", CreatedAt: time.Unix(0, 0),
 		}, &echoed)
-		if echoed.Id != "r2" {
+		// The reply is echoed back as the stored tweet so the Warpnet UI renders it.
+		if echoed.Id != "r2" || echoed.ParentId == nil || *echoed.ParentId != noteURL {
 			t.Fatalf("echo = %+v", echoed)
 		}
 		got := f.delivered()[before:]
@@ -459,11 +494,11 @@ func TestNodeServerWriteRoutes(t *testing.T) {
 	t.Run("delete", func(t *testing.T) {
 		before := len(f.delivered())
 		// Without thread ids there is no Mastodon note to target: acknowledge only.
-		fx.call(t, routeDeleteTweet, deleteTweetRequest{UserId: "alice", TweetId: "x"}, nil)
+		fx.call(t, routeDeleteTweet, deleteTweetEvent{UserId: "alice", TweetId: "x"}, nil)
 		if len(f.delivered()) != before {
 			t.Fatal("a non-reply delete must not federate")
 		}
-		fx.call(t, routeDeleteTweet, deleteTweetRequest{
+		fx.call(t, routeDeleteTweet, deleteTweetEvent{
 			UserId: "alice", TweetId: "r1", ParentId: noteURL, RootId: noteURL,
 		}, nil)
 		got := f.delivered()[before:]
@@ -513,38 +548,20 @@ func TestWrapJSON(t *testing.T) {
 	}
 }
 
-func TestReplyEcho(t *testing.T) {
-	parent := "https://m/users/bob/statuses/9"
-	ev := newReplyEvent{
-		Id: "r1", RootId: "https://m/users/bob/statuses/1", ParentId: &parent,
-		Text: "hi", UserId: "alice", Username: "Alice", CreatedAt: time.Unix(0, 0),
+// A react answers the favourite tally attributed to the emoji the reactor named,
+// so the client can repaint its chips without a second round-trip. An unreact
+// names no emoji, so only the total travels.
+func TestReactionsCount(t *testing.T) {
+	got := reactionsCount(domain.DefaultReaction, 3)
+	if got.Count != 3 || got.Reactions[domain.DefaultReaction] != 3 {
+		t.Fatalf("react = %+v", got)
 	}
-	got := replyEcho(ev)
-	if got.Id != "r1" || got.Text != "hi" || got.Network != mastodonNetwork {
-		t.Fatalf("echo = %+v", got)
+	if got := reactionsCount("", 2); got.Count != 2 || got.Reactions != nil {
+		t.Fatalf("unreact = %+v, want the total only", got)
 	}
-	if got.ParentId == nil || *got.ParentId != parent {
-		t.Fatalf("parent = %v", got.ParentId)
-	}
-	if got.RootId != "https://m/users/bob/statuses/1" {
-		t.Fatalf("root = %q", got.RootId)
-	}
-
-	t.Run("without a parent the root is the parent", func(t *testing.T) {
-		got := replyEcho(newReplyEvent{Id: "r2", RootId: "https://m/1", UserId: "alice"})
-		if got.ParentId == nil || *got.ParentId != "https://m/1" {
-			t.Fatalf("parent = %v", got.ParentId)
-		}
-	})
-}
-
-func TestReplyEventFromTweetWithoutAParent(t *testing.T) {
-	got := replyEventFromTweet(tweet{Id: "r1", RootId: "https://m/1", UserId: "alice"})
-	if got.ParentId != nil {
-		t.Fatalf("ParentId = %v, want nil when the tweet carries none", got.ParentId)
-	}
-	if got.RootId != "https://m/1" {
-		t.Fatalf("RootId = %q", got.RootId)
+	// A zero tally must not claim an emoji with no reactions behind it.
+	if got := reactionsCount(domain.DefaultReaction, 0); got.Reactions != nil {
+		t.Fatalf("zero = %+v, want no breakdown", got)
 	}
 }
 
