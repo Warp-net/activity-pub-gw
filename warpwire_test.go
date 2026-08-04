@@ -9,18 +9,27 @@ import (
 	"testing"
 	"time"
 
+	wjson "github.com/Warp-net/warpnet/json"
 	"github.com/Warp-net/warpnet/security"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// signingInput mirrors warpnet's event.Message.SigningBytes; if the framing ever
-// drifts, every envelope the gateway sends is rejected by the node.
-func TestSigningInput(t *testing.T) {
+// signingEnvelope frames a body/timestamp the way the wire does, so a test can
+// ask what bytes the signature covers.
+func signingEnvelope(body []byte, ts time.Time) message {
+	return message{Body: wjson.RawMessage(body), Timestamp: ts}
+}
+
+// The gateway signs with warpnet's own Message.SigningBytes: the raw body
+// followed by the timestamp as decimal Unix nanoseconds. Pinned here because a
+// warpnet bump that changed the framing would silently get every envelope the
+// gateway sends rejected by the node — and every one it receives dropped.
+func TestSigningBytesFraming(t *testing.T) {
 	ts := time.Unix(0, 1700000000123456789)
-	if got := string(signingInput([]byte("body"), ts)); got != "body1700000000123456789" {
-		t.Fatalf("signingInput = %q", got)
+	if got := string(signingEnvelope([]byte("body"), ts).SigningBytes()); got != "body1700000000123456789" {
+		t.Fatalf("SigningBytes = %q", got)
 	}
-	if got := string(signingInput(nil, ts)); got != "1700000000123456789" {
+	if got := string(signingEnvelope(nil, ts).SigningBytes()); got != "1700000000123456789" {
 		t.Fatalf("empty body = %q", got)
 	}
 }
@@ -34,19 +43,19 @@ func TestStreamSignatureVerifiesAgainstThePeerKey(t *testing.T) {
 	}
 	body := []byte(`{"user_id":"alice"}`)
 	ts := time.Now()
-	sig := security.Sign(priv, signingInput(body, ts))
+	sig := security.Sign(priv, signingEnvelope(body, ts).SigningBytes())
 	pub, ok := ed25519.PrivateKey(priv).Public().(ed25519.PublicKey)
 	if !ok {
 		t.Fatal("not an ed25519 key")
 	}
 
-	if verr := security.VerifySignature(pub, signingInput(body, ts), sig); verr != nil {
+	if verr := security.VerifySignature(pub, signingEnvelope(body, ts).SigningBytes(), sig); verr != nil {
 		t.Fatalf("verify: %v", verr)
 	}
-	if verr := security.VerifySignature(pub, signingInput([]byte("tampered"), ts), sig); verr == nil {
+	if verr := security.VerifySignature(pub, signingEnvelope([]byte("tampered"), ts).SigningBytes(), sig); verr == nil {
 		t.Fatal("a tampered body must not verify")
 	}
-	if verr := security.VerifySignature(pub, signingInput(body, ts.Add(time.Second)), sig); verr == nil {
+	if verr := security.VerifySignature(pub, signingEnvelope(body, ts.Add(time.Second)).SigningBytes(), sig); verr == nil {
 		t.Fatal("a replaced timestamp must not verify")
 	}
 }

@@ -32,6 +32,8 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	"github.com/Warp-net/warpnet/domain"
 )
 
 const (
@@ -57,12 +59,15 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 		if !ok {
 			return "", nil, false
 		}
-		// OwnerId is the liker, UserId the liked tweet's author (the direction
-		// the node's like handler and the client both use). Swapping them books
-		// the like as the author liking their own tweet: no notification, and
-		// the node forwards the like straight back to us.
-		return routePostLike, likeEvent{
+		// OwnerId is the reactor, UserId the reacted tweet's author (the
+		// direction the node's reaction handler and the client both use).
+		// Swapping them books the reaction as the author reacting to their own
+		// tweet: no notification, and the node forwards it straight back to us.
+		// A Mastodon favourite is the default heart — the only reaction the
+		// Fediverse side can express.
+		return routePostReact, reactionEvent{
 			TweetId: tweetID, UserId: owner, OwnerId: bridgedUserID(actor),
+			Emoji: domain.DefaultReaction,
 		}, true
 
 	case typeAnnounce:
@@ -124,16 +129,15 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 				text = rest
 			}
 		}
-		pid := parentID
-		// Warpnet consolidated replies into the tweet path: it accepts a reply
-		// as a tweet with a parent on the private tweet route, not the retired
-		// PUBLIC_POST_REPLY route. parent_user_id lets the owner's node raise the
-		// reply notification.
-		return routePostTweet, newReplyEvent{
+		pid, powner := parentID, owner
+		// Warpnet consolidated replies into the tweet path: a reply is a tweet
+		// carrying a parent, sent on the private tweet route. parent_user_id
+		// lets the owner's node raise the reply notification.
+		return routePostTweet, tweet{
 			CreatedAt:    time.Now(),
 			Id:           ingestedNoteID(obj),
 			ParentId:     &pid,
-			ParentUserId: owner,
+			ParentUserId: &powner,
 			RootId:       parentID,
 			Text:         text,
 			UserId:       bridgedUserID(actor),
@@ -159,7 +163,8 @@ func (g *gateway) translateInbound(raw map[string]any) (string, any, bool) {
 			if !ok {
 				return "", nil, false
 			}
-			return routePostUnlike, likeEvent{
+			// Unreact drops whatever emoji the reactor had, so it carries none.
+			return routePostUnreact, reactionEvent{
 				TweetId: tweetID, UserId: owner, OwnerId: bridgedUserID(actor),
 			}, true
 		case typeAnnounce:

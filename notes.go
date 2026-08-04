@@ -110,7 +110,7 @@ func (g *gateway) serveStatus(w http.ResponseWriter, r *http.Request, user, twee
 		http.NotFound(w, r)
 		return
 	}
-	req := getTweetRequest{TweetId: tweetID, UserId: user}
+	req := getTweetEvent{TweetId: tweetID, UserId: user}
 	// A reply carries its parent url on the id (see b.Reply); pass it so the node
 	// can look the reply up in the parent's thread index instead of the timeline.
 	if parent := r.URL.Query().Get(replyParentQuery); parent != "" {

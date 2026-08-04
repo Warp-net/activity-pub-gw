@@ -42,6 +42,7 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/Warp-net/warpnet/core/warpnet"
+	"github.com/Warp-net/warpnet/domain"
 	"github.com/Warp-net/warpnet/event"
 	wjson "github.com/Warp-net/warpnet/json"
 	"github.com/Warp-net/warpnet/security"
@@ -80,20 +81,11 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 			}
 			return event.UsersResponse{Users: []user{u}}, nil
 		}),
-		routeGetTweets: wrapJSON(func(ctx context.Context, ev getTweetsRequest) (any, error) {
+		routeGetTweets: wrapJSON(func(ctx context.Context, ev getAllTweetsEvent) (any, error) {
 			return b.GetTweetsOrReplies(ctx, ev)
 		}),
 		routeGetTweet: wrapJSON(func(ctx context.Context, ev getTweetEvent) (any, error) {
 			return b.GetTweet(ctx, string(ev.TweetId))
-		}),
-		routeGetReplies: wrapJSON(func(ctx context.Context, ev getRepliesEvent) (any, error) {
-			// The note whose replies are wanted is the parent (a specific reply)
-			// or the thread root for top-level replies; both are AP note URLs.
-			id := string(ev.ParentId)
-			if id == "" {
-				id = string(ev.RootId)
-			}
-			return b.GetReplies(ctx, id)
 		}),
 		event.PUBLIC_GET_TWEET_STATS: wrapJSON(func(ctx context.Context, ev getTweetEvent) (any, error) {
 			return b.GetTweetStats(ctx, string(ev.TweetId))
@@ -111,13 +103,27 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 			return event.ViewsCountResponse{Count: 1}, nil
 		},
 
-		routePostLike: wrapJSON(func(ctx context.Context, ev likeEvent) (any, error) {
-			count, err := b.Like(ctx, string(ev.OwnerId), string(ev.TweetId), false)
-			return event.LikesCountResponse{Count: count}, err
+		// A Warpnet reaction on a bridged status federates as an AP Like — a
+		// Mastodon favourite — which only the default heart maps onto (React
+		// drops any other emoji). The per-emoji breakdown mirrors it so the
+		// client repaints the heart chip without a second round-trip.
+		//
+		// The emoji is normalized here, at the wire boundary: the node forwards
+		// whatever the client sent, and a client that predates reactions sends
+		// none — which means the default heart, i.e. a favourite.
+		routePostReact: wrapJSON(func(ctx context.Context, ev reactionEvent) (any, error) {
+			emoji, err := domain.NormalizeReaction(ev.Emoji)
+			if err != nil {
+				return nil, err
+			}
+			count, rerr := b.React(ctx, string(ev.OwnerId), string(ev.TweetId), emoji, false)
+			return reactionsCount(emoji, count), rerr
 		}),
-		routePostUnlike: wrapJSON(func(ctx context.Context, ev likeEvent) (any, error) {
-			count, err := b.Like(ctx, string(ev.OwnerId), string(ev.TweetId), true)
-			return event.LikesCountResponse{Count: count}, err
+		// An unreact drops whichever reaction the user had, so it names no emoji
+		// and always federates as an Undo(Like).
+		routePostUnreact: wrapJSON(func(ctx context.Context, ev reactionEvent) (any, error) {
+			count, err := b.React(ctx, string(ev.OwnerId), string(ev.TweetId), "", true)
+			return reactionsCount("", count), err
 		}),
 		routePostFollow: wrapJSON(func(ctx context.Context, ev newFollowEvent) (any, error) {
 			return struct{}{}, b.Follow(ctx, string(ev.FollowerId), string(ev.FollowingId), false)
@@ -125,29 +131,27 @@ func (c *nodeClient) serveRoutes(g *gateway, ownerHandle string) {
 		routePostUnfollow: wrapJSON(func(ctx context.Context, ev newFollowEvent) (any, error) {
 			return struct{}{}, b.Follow(ctx, string(ev.FollowerId), string(ev.FollowingId), true)
 		}),
-		routePostReply: wrapJSON(func(ctx context.Context, ev newReplyEvent) (any, error) {
-			return replyEcho(ev), b.Reply(ctx, ev)
-		}),
 		// Warpnet consolidated replies into the tweet path: a reply is a tweet
 		// with a parent, forwarded to the parent author's node over the private
-		// tweet route (PUBLIC_POST_REPLY is no longer sent). Federate replies as
+		// tweet route (the standalone reply route is gone). Federate replies as
 		// AP replies; a top-level owner post arrives here via follower gossip, so
 		// federate it to the author's Fediverse followers in real time (the poller
 		// is a slower backstop; delivery is idempotent by Create/Note id).
 		routePostTweet: wrapJSON(func(ctx context.Context, ev tweet) (any, error) {
-			if ev.ParentId == nil || *ev.ParentId == "" {
+			if !ev.IsReply() {
 				if publishableTweet(ev, ev.UserId) {
 					g.federateTweetAsync(ev)
 				}
 				return ev, nil
 			}
-			re := replyEventFromTweet(ev)
-			return replyEcho(re), b.Reply(ctx, re)
+			// Echo the reply back as the tweet the node stored, so the Warpnet
+			// UI renders it.
+			return ev, b.Reply(ctx, ev)
 		}),
 		// Warpnet forwards a reply deletion to the parent author's node over the
 		// private delete route; federate it as an AP Delete. Only a reply (a
 		// parent set) targets a Mastodon note; anything else is acknowledged.
-		routeDeleteTweet: wrapJSON(func(ctx context.Context, ev deleteTweetRequest) (any, error) {
+		routeDeleteTweet: wrapJSON(func(ctx context.Context, ev deleteTweetEvent) (any, error) {
 			if ev.ParentId == "" && ev.RootId == "" {
 				return struct{}{}, nil
 			}
@@ -192,7 +196,7 @@ func (c *nodeClient) streamHandler(route string, h routeHandler) network.StreamH
 		}
 		if conn := s.Conn(); conn != nil {
 			pub := warpnet.FromIDToPubKey(conn.RemotePeer())
-			if verr := security.VerifySignature(pub, signingInput(msg.Body, msg.Timestamp), msg.Signature); verr != nil {
+			if verr := security.VerifySignature(pub, msg.SigningBytes(), msg.Signature); verr != nil {
 				log.Warnf("nodeserver: %s: signature from %s invalid: %v", route, conn.RemotePeer(), verr)
 				return
 			}
@@ -261,42 +265,15 @@ func wrapJSON[T any](h func(context.Context, T) (any, error)) routeHandler {
 	}
 }
 
-// replyEcho echoes a reply back as a tweet so the Warpnet UI renders it.
-func replyEcho(ev newReplyEvent) tweet {
-	parent := string(ev.RootId)
-	if ev.ParentId != nil {
-		parent = string(*ev.ParentId)
+// reactionsCount answers a react/unreact with the status's favourite tally,
+// attributed to the emoji the reactor named (an unreact names none, so the
+// breakdown is left off and only the total travels).
+func reactionsCount(emoji string, count uint64) event.ReactionsCountResponse {
+	resp := event.ReactionsCountResponse{Count: count}
+	if emoji != "" && count > 0 {
+		resp.Reactions = map[string]uint64{emoji: count}
 	}
-	return tweet{
-		Id:        string(ev.Id),
-		ParentId:  &parent,
-		RootId:    string(ev.RootId),
-		Text:      ev.Text,
-		UserId:    string(ev.UserId),
-		Username:  ev.Username,
-		CreatedAt: ev.CreatedAt,
-		Network:   mastodonNetwork,
-	}
-}
-
-// replyEventFromTweet adapts a reply forwarded over the private tweet route (a
-// tweet carrying a parent) into the reply event the bridge federates. The
-// parent author is derived from the parent note URL by Reply, so only the
-// thread ids, author and text are needed here.
-func replyEventFromTweet(ev tweet) newReplyEvent {
-	re := newReplyEvent{
-		CreatedAt: ev.CreatedAt,
-		Id:        ev.Id,
-		RootId:    ev.RootId,
-		Text:      ev.Text,
-		UserId:    ev.UserId,
-		Username:  ev.Username,
-	}
-	if ev.ParentId != nil {
-		pid := *ev.ParentId
-		re.ParentId = &pid
-	}
-	return re
+	return resp
 }
 
 func retweeterOf(ev tweet) string {

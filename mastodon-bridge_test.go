@@ -234,24 +234,22 @@ func TestRestReplyToTweet(t *testing.T) {
 	}
 }
 
-func TestRepliesToTweetsFlattensTheTree(t *testing.T) {
-	rr := repliesResponse{Replies: []domain.ReplyNode{
-		{Reply: tweet{Id: "a"}, Children: []domain.ReplyNode{
-			{Reply: tweet{Id: "a1"}, Children: []domain.ReplyNode{{Reply: tweet{Id: "a1x"}}}},
-		}},
-		{Reply: tweet{Id: "b"}},
-	}}
-	got := repliesToTweets(rr)
-	var ids []string
-	for _, tw := range got.Tweets {
-		ids = append(ids, tw.Id)
+// A thread with no replies must still answer a non-nil list: a nil slice
+// marshals as JSON null, which the client cannot iterate.
+func TestGetRepliesEmptyThreadIsNonNil(t *testing.T) {
+	b, _, f := newBridgeFixture(t)
+	f.serveDoc("/api/v1/statuses/100/context", "application/json", map[string]any{
+		"ancestors": []any{}, "descendants": []any{},
+	})
+	resp, err := b.GetReplies(context.Background(), f.url("/users/alice/statuses/100"))
+	if err != nil {
+		t.Fatalf("GetReplies: %v", err)
 	}
-	// The client parses this route's response as a flat list, not a tree.
-	if !reflect.DeepEqual(ids, []string{"a", "a1", "a1x", "b"}) {
-		t.Fatalf("ids = %v, want depth-first order", ids)
+	if resp.Tweets == nil {
+		t.Fatal("an empty thread must still yield a non-nil list")
 	}
-	if repliesToTweets(repliesResponse{}).Tweets == nil {
-		t.Fatal("an empty tree must still yield a non-nil list")
+	if len(resp.Tweets) != 0 {
+		t.Fatalf("tweets = %+v, want none", resp.Tweets)
 	}
 }
 
@@ -392,7 +390,7 @@ func TestGetTweetsOrRepliesDispatch(t *testing.T) {
 
 	// A thread-replies request carries parent_id/root_id and must come back as a
 	// flat tweet list, not the reply tree.
-	resp, err := b.GetTweetsOrReplies(context.Background(), getTweetsRequest{ParentId: root})
+	resp, err := b.GetTweetsOrReplies(context.Background(), getAllTweetsEvent{ParentId: root})
 	if err != nil {
 		t.Fatalf("by parent: %v", err)
 	}
@@ -400,7 +398,7 @@ func TestGetTweetsOrRepliesDispatch(t *testing.T) {
 		t.Fatalf("tweets = %+v", resp.Tweets)
 	}
 
-	resp, err = b.GetTweetsOrReplies(context.Background(), getTweetsRequest{RootId: root})
+	resp, err = b.GetTweetsOrReplies(context.Background(), getAllTweetsEvent{RootId: root})
 	if err != nil {
 		t.Fatalf("by root: %v", err)
 	}
@@ -594,8 +592,13 @@ func TestGetTweetStatsFallsBackToAPCollections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTweetStats: %v", err)
 	}
-	if got.LikeCount != 4 || got.RetweetsCount != 2 || got.RepliesCount != 6 {
+	if got.ReactionsCount != 4 || got.RetweetsCount != 2 || got.RepliesCount != 6 {
 		t.Fatalf("stats = %+v", got)
+	}
+	// The AP likes collection is the favourite count, which reads back as the
+	// default heart in the per-emoji breakdown the client paints chips from.
+	if got.Reactions[domain.DefaultReaction] != 4 {
+		t.Fatalf("stats.Reactions = %v, want 4 hearts", got.Reactions)
 	}
 	if string(got.TweetId) != noteURL {
 		t.Fatalf("TweetId = %q", got.TweetId)
@@ -629,8 +632,8 @@ func TestApRepliesInlineAndPaged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apReplies: %v", err)
 	}
-	if len(resp.Replies) != 2 {
-		t.Fatalf("replies = %+v, want both pages walked", resp.Replies)
+	if len(resp.Tweets) != 2 {
+		t.Fatalf("replies = %+v, want both pages walked", resp.Tweets)
 	}
 }
 
@@ -644,8 +647,8 @@ func TestApRepliesEdgeCases(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(resp.Replies) != 0 || resp.Replies == nil {
-			t.Fatalf("replies = %v, want an empty (non-nil) list", resp.Replies)
+		if len(resp.Tweets) != 0 || resp.Tweets == nil {
+			t.Fatalf("replies = %v, want an empty (non-nil) list", resp.Tweets)
 		}
 	})
 
@@ -657,8 +660,8 @@ func TestApRepliesEdgeCases(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err = %v, want a hidden collection treated as empty", err)
 		}
-		if len(resp.Replies) != 0 {
-			t.Fatalf("replies = %v", resp.Replies)
+		if len(resp.Tweets) != 0 {
+			t.Fatalf("replies = %v", resp.Tweets)
 		}
 	})
 
@@ -683,8 +686,8 @@ func TestApRepliesEdgeCases(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(resp.Replies) != maxReplies {
-			t.Fatalf("replies = %d, want them capped at %d", len(resp.Replies), maxReplies)
+		if len(resp.Tweets) != maxReplies {
+			t.Fatalf("replies = %d, want them capped at %d", len(resp.Tweets), maxReplies)
 		}
 	})
 }
@@ -862,7 +865,9 @@ func TestGetImage(t *testing.T) {
 	})
 }
 
-func TestLikeFederatesAndAdjustsTheCount(t *testing.T) {
+// The default heart is the reaction Mastodon can express, so it federates as an
+// AP Like — a favourite. Any other emoji has no Mastodon equivalent.
+func TestReactFederatesTheHeartAndAdjustsTheCount(t *testing.T) {
 	b, g, f := newBridgeFixture(t)
 	actorURL := f.actor("bob", nil)
 	f.serveDoc("/notes/1", contentTypeAP, map[string]any{
@@ -870,14 +875,14 @@ func TestLikeFederatesAndAdjustsTheCount(t *testing.T) {
 		"likes": map[string]any{"totalItems": float64(3)},
 	})
 
-	count, err := b.Like(context.Background(), "alice", f.url("/notes/1"), false)
+	count, err := b.React(context.Background(), "alice", f.url("/notes/1"), domain.DefaultReaction, false)
 	if err != nil {
-		t.Fatalf("Like: %v", err)
+		t.Fatalf("React: %v", err)
 	}
 	// The note was fetched before the Like federated, so the caller must see the
 	// new value, not the stale one.
 	if count != 4 {
-		t.Fatalf("count = %d, want the like counted", count)
+		t.Fatalf("count = %d, want the favourite counted", count)
 	}
 	got := f.delivered()
 	if len(got) != 1 || got[0].doc["type"] != typeLike {
@@ -887,8 +892,10 @@ func TestLikeFederatesAndAdjustsTheCount(t *testing.T) {
 		t.Fatalf("actor = %v", got[0].doc["actor"])
 	}
 
-	t.Run("an unlike wraps the Like in an Undo and decrements", func(t *testing.T) {
-		count, err := b.Like(context.Background(), "alice", f.url("/notes/1"), true)
+	t.Run("an unreact wraps the Like in an Undo and decrements", func(t *testing.T) {
+		// An unreact drops whichever emoji the reactor had, so it carries none
+		// and must still federate.
+		count, err := b.React(context.Background(), "alice", f.url("/notes/1"), "", true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -902,11 +909,11 @@ func TestLikeFederatesAndAdjustsTheCount(t *testing.T) {
 		}
 	})
 
-	t.Run("an unlike never underflows", func(t *testing.T) {
+	t.Run("an unreact never underflows", func(t *testing.T) {
 		f.serveDoc("/notes/zero", contentTypeAP, map[string]any{
 			"type": typeNote, "id": f.url("/notes/zero"), "attributedTo": actorURL,
 		})
-		count, err := b.Like(context.Background(), "alice", f.url("/notes/zero"), true)
+		count, err := b.React(context.Background(), "alice", f.url("/notes/zero"), "", true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -915,8 +922,24 @@ func TestLikeFederatesAndAdjustsTheCount(t *testing.T) {
 		}
 	})
 
+	t.Run("a non-heart emoji is accepted but not federated", func(t *testing.T) {
+		before := len(f.delivered())
+		count, err := b.React(context.Background(), "alice", f.url("/notes/1"), "🔥", false)
+		if err != nil {
+			t.Fatalf("a reaction Mastodon cannot express must not fail: %v", err)
+		}
+		if count != 0 {
+			t.Fatalf("count = %d, want 0: no favourite was made", count)
+		}
+		// Mastodon has no emoji reaction; sending a Like would book a favourite
+		// the reactor never asked for.
+		if now := len(f.delivered()); now != before {
+			t.Fatalf("delivered %d activities, want none", now-before)
+		}
+	})
+
 	t.Run("an unreachable note is an error", func(t *testing.T) {
-		if _, err := b.Like(context.Background(), "alice", f.url("/notes/ghost"), false); err == nil {
+		if _, err := b.React(context.Background(), "alice", f.url("/notes/ghost"), domain.DefaultReaction, false); err == nil {
 			t.Fatal("expected an error")
 		}
 	})
@@ -998,7 +1021,7 @@ func TestDeleteFederatesATombstone(t *testing.T) {
 	parentURL := f.url("/notes/parent")
 	f.serveDoc("/notes/parent", contentTypeAP, apNote(parentURL, actorURL, "<p>parent</p>"))
 
-	err := b.Delete(context.Background(), deleteTweetRequest{
+	err := b.Delete(context.Background(), deleteTweetEvent{
 		UserId: "alice", TweetId: "r1", ParentId: parentURL, RootId: parentURL,
 	})
 	if err != nil {
@@ -1021,7 +1044,7 @@ func TestDeleteFederatesATombstone(t *testing.T) {
 	}
 
 	t.Run("falls back to the root when no parent is given", func(t *testing.T) {
-		err := b.Delete(context.Background(), deleteTweetRequest{
+		err := b.Delete(context.Background(), deleteTweetEvent{
 			UserId: "alice", TweetId: "r2", RootId: parentURL,
 		})
 		if err != nil {
@@ -1030,7 +1053,7 @@ func TestDeleteFederatesATombstone(t *testing.T) {
 	})
 
 	t.Run("an unreachable parent is an error", func(t *testing.T) {
-		err := b.Delete(context.Background(), deleteTweetRequest{
+		err := b.Delete(context.Background(), deleteTweetEvent{
 			UserId: "alice", TweetId: "r3", ParentId: f.url("/notes/ghost"),
 		})
 		if err == nil {
@@ -1045,7 +1068,7 @@ func TestReplyAddressesAndThreadsTheParentAuthor(t *testing.T) {
 	parentURL := f.url("/users/bob/statuses/9")
 	f.serveDoc("/users/bob/statuses/9", contentTypeAP, apNote(parentURL, actorURL, "<p>parent</p>"))
 
-	err := b.Reply(context.Background(), newReplyEvent{
+	err := b.Reply(context.Background(), tweet{
 		Id: "r1", UserId: "alice", RootId: domain.ID(parentURL), Text: "nice",
 	})
 	if err != nil {
@@ -1077,7 +1100,7 @@ func TestReplyAddressesAndThreadsTheParentAuthor(t *testing.T) {
 
 	t.Run("a reply with no node-assigned id still gets one", func(t *testing.T) {
 		pid := parentURL
-		err := b.Reply(context.Background(), newReplyEvent{
+		err := b.Reply(context.Background(), tweet{
 			UserId: "alice", ParentId: &pid, Text: "anon",
 		})
 		if err != nil {
@@ -1091,7 +1114,7 @@ func TestReplyAddressesAndThreadsTheParentAuthor(t *testing.T) {
 	})
 
 	t.Run("an unreachable parent is an error", func(t *testing.T) {
-		err := b.Reply(context.Background(), newReplyEvent{
+		err := b.Reply(context.Background(), tweet{
 			UserId: "alice", RootId: domain.ID(f.url("/notes/ghost")), Text: "x",
 		})
 		if err == nil {
@@ -1183,7 +1206,7 @@ func TestRestTweetsFallsBackWhenLookupIsUnusable(t *testing.T) {
 // client would render as "no replies".
 func TestGetTweetsOrRepliesPropagatesFailures(t *testing.T) {
 	b, _, f := newBridgeFixture(t)
-	if _, err := b.GetTweetsOrReplies(context.Background(), getTweetsRequest{ParentId: f.url("/notes/ghost")}); err == nil {
+	if _, err := b.GetTweetsOrReplies(context.Background(), getAllTweetsEvent{ParentId: f.url("/notes/ghost")}); err == nil {
 		t.Fatal("expected an error")
 	}
 }
