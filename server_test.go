@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -681,6 +682,36 @@ func TestFetchMedia(t *testing.T) {
 	}
 	if _, _, err := g.fetchMedia(ctx, f.url("/missing.png")); !errors.Is(err, errRemoteStatus) {
 		t.Fatalf("404: err = %v", err)
+	}
+}
+
+// A media file above the limit must be an error, never silently truncated:
+// nodes cache whatever bytes we hand them, so half an image would be served
+// as the real thing until its TTL expires.
+func TestFetchMediaRejectsOversizedFiles(t *testing.T) {
+	g := testGateway(t)
+	f := newFakeInstance(t).attach(g)
+	ctx := context.Background()
+
+	f.on("/at-limit.png", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(headerContentType, "image/png")
+		_, _ = w.Write(bytes.Repeat([]byte{0xAB}, maxMediaBytes))
+	})
+	f.on("/oversize.png", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(headerContentType, "image/png")
+		_, _ = w.Write(bytes.Repeat([]byte{0xAB}, maxMediaBytes+1))
+	})
+
+	_, data, err := g.fetchMedia(ctx, f.url("/at-limit.png"))
+	if err != nil {
+		t.Fatalf("at-limit fetch: %v", err)
+	}
+	if len(data) != maxMediaBytes {
+		t.Fatalf("at-limit: got %d bytes, want %d", len(data), maxMediaBytes)
+	}
+
+	if _, _, err := g.fetchMedia(ctx, f.url("/oversize.png")); !errors.Is(err, errBodyTooLarge) {
+		t.Fatalf("oversize: err = %v, want errBodyTooLarge", err)
 	}
 }
 
