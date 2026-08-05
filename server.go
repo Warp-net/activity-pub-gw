@@ -60,6 +60,11 @@ const (
 
 	maxBodyBytes = 1 << 20
 
+	// maxMediaBytes bounds a media (attachment) download. Mastodon serves
+	// original images up to 16 MB; capping lower silently truncated large
+	// PNGs and nodes cached the broken bytes.
+	maxMediaBytes = 16 << 20
+
 	// maxInflightDeliveries bounds concurrent outbound Accept deliveries so a
 	// burst of inbound Follow activities can't spawn unbounded goroutines.
 	maxInflightDeliveries = 16
@@ -95,6 +100,7 @@ var (
 	errBlockedHost      = errors.New("remote URL host is not allowed")
 	errTooManyRedirects = errors.New("too many redirects")
 	errSelfTarget       = errors.New("remote URL targets this gateway")
+	errBodyTooLarge     = errors.New("remote body exceeds the size limit")
 )
 
 // gateway is the ActivityPub front for one bridged Warpnet user. Documents are
@@ -699,8 +705,9 @@ func retryableStatus(code int) bool {
 // newReq must build a fresh request each call (the body is consumed per
 // attempt). A non-retryable status returns nil error with the status/body so
 // the caller can render its own message; an exhausted/transport error is
-// returned as err.
-func (g *gateway) sendRetry(ctx context.Context, newReq func() (*http.Request, error)) (status int, body []byte, header http.Header, err error) {
+// returned as err. A success body larger than limit is an error, never a
+// silent truncation — half an image is worse than none.
+func (g *gateway) sendRetry(ctx context.Context, limit int64, newReq func() (*http.Request, error)) (status int, body []byte, header http.Header, err error) {
 	do := func() error {
 		req, rerr := newReq()
 		if rerr != nil {
@@ -715,12 +722,15 @@ func (g *gateway) sendRetry(ctx context.Context, newReq func() (*http.Request, e
 		}
 		defer func() { _ = resp.Body.Close() }()
 		status, header = resp.StatusCode, resp.Header
-		body, rerr = io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+		body, rerr = io.ReadAll(io.LimitReader(resp.Body, limit+1))
 		if rerr != nil {
 			return rerr // truncated/transient read: retry
 		}
 		if status >= 300 && retryableStatus(status) {
 			return fmt.Errorf("status %d: %w", status, errRemoteStatus)
+		}
+		if status < 300 && int64(len(body)) > limit {
+			return fmt.Errorf("%w: %w", errBodyTooLarge, retrier.ErrStopTrying)
 		}
 		return nil
 	}
@@ -750,7 +760,7 @@ func (g *gateway) signedGet(ctx context.Context, rawURL, accept string) (int, []
 			}
 		}
 		start := time.Now()
-		status, bt, _, ferr := g.sendRetry(ctx, func() (*http.Request, error) {
+		status, bt, _, ferr := g.sendRetry(ctx, maxBodyBytes, func() (*http.Request, error) {
 			req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 			if rerr != nil {
 				return nil, rerr
@@ -886,7 +896,7 @@ func (g *gateway) fetchMedia(ctx context.Context, rawURL string) (string, []byte
 		return "", nil, err
 	}
 	start := time.Now()
-	status, bt, header, err := g.sendRetry(ctx, func() (*http.Request, error) {
+	status, bt, header, err := g.sendRetry(ctx, maxMediaBytes, func() (*http.Request, error) {
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if rerr != nil {
 			return nil, rerr
@@ -916,7 +926,7 @@ func (g *gateway) postSigned(ctx context.Context, localUser, target string, doc 
 	// https and newSafeClient guards redirects + the resolved dial IP. A retried
 	// delivery re-signs (fresh Date) and re-sends the same activity id, which the
 	// peer deduplicates — safe to retry on transient (429/5xx) failures.
-	status, respBody, _, err := g.sendRetry(ctx, func() (*http.Request, error) {
+	status, respBody, _, err := g.sendRetry(ctx, maxBodyBytes, func() (*http.Request, error) {
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 		if rerr != nil {
 			return nil, rerr
